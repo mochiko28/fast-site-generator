@@ -4,8 +4,10 @@ const HIGH = /[^\x00-\x7f]/;
 const ASCII_SPACE = /[\t-\r ]/;
 const ASCII_TRIM = /^[\t-\r ]+|[\t-\r ]+$/g;
 const BYTE_SPACE = /\xc2\xa0|\xe1\x9a\x80|\xe2\x80[\x80-\x8a\xa8\xa9\xaf]|\xe2\x81\x9f|\xe3\x80\x80|\xef\xbb\xbf/;
+const MARKDOWN_BYTE_SPACE = new RegExp(ASCII_SPACE.source + '|' + BYTE_SPACE.source);
 const BYTE_SEPARATOR = /\xe2\x80[\xa8\xa9]/;
-const SEPARATOR = /[\u2028\u2029]/;
+const MARKDOWN_BYTE_SEPARATOR = /\r|\xe2\x80[\xa8\xa9]/;
+const MARKDOWN_SEPARATOR = /[\r\u2028\u2029]/;
 const SUPPLEMENTARY_BYTE = /[\xf0-\xf4]/;
 const MONTHS = [
   'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
@@ -24,7 +26,7 @@ function trim(text, latin1) {
 }
 
 function hasSpace(text, latin1) {
-  return latin1 ? ASCII_SPACE.test(text) || BYTE_SPACE.test(text) : /\s/.test(text);
+  return latin1 ? MARKDOWN_BYTE_SPACE.test(text) : /\s/.test(text);
 }
 
 function slugify(text, latin1) {
@@ -63,8 +65,8 @@ function trimLine(line) {
   return start === 0 && end === line.length ? line : line.slice(start, end);
 }
 
-function onlyIndent(line, start = 0) {
-  for (let i = start; i < line.length; i++) {
+function onlyIndent(line, start = 0, end = line.length) {
+  for (let i = start; i < end; i++) {
     const c = line.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
@@ -193,8 +195,8 @@ function jsonText(text) {
 }
 
 class RenderedString {
-  constructor(json) {
-    this.json = json;
+  constructor(text) {
+    this.json = jsonText(text);
     this.text = undefined;
   }
 
@@ -203,85 +205,133 @@ class RenderedString {
   }
 }
 
-const INLINE_ESCAPE = JSON_CHAR.slice();
-INLINE_ESCAPE[34] = '&quot;';
-INLINE_ESCAPE[38] = '&amp;';
-INLINE_ESCAPE[39] = '&#39;';
-INLINE_ESCAPE[60] = '&lt;';
-INLINE_ESCAPE[62] = '&gt;';
-INLINE_ESCAPE[92] = '\\\\';
-
-function inlinePattern(target, surrogate) {
-  // A delimiter search skips escaped marks. Emphasis also skips pairs of
-  // stars. A failed strong opener consumes its pair of stars as literal text.
-  const strong = /\*\*(?!\*\*)[^\\*]*(?:(?:\\(?:[\\*]|(?![\\*]))|\*(?!\*))[^\\*]*)*\*\*|\*\*/;
-  const emphasis = /\*[^\\*]*(?:(?:\\(?:[\\*]|(?![\\*]))|\*\*)[^\\*]*)*\*(?!\*)/;
-  const linkStart = /\[[^\\\]]*(?:\\(?:[\\\]]|(?![\\\]]))[^\\\]]*)*\]\(/;
-  return new RegExp(
-    /\\[\\`*_\[\]()#+.!>\-]|`[^`]+`/.source + '|' +
-    strong.source + '|' + emphasis.source + '|' + linkStart.source + target + '\\)|' +
-    '[&<>"\'\\\\\\x00-\\x1f' + surrogate + ']', 'g');
+function escapeHtml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-// Scan ordinary target bytes in runs and check for Unicode whitespace at
-// the UTF-8 lead bytes that can start it.
-const INLINE_BYTES = inlinePattern(
-  /(?=[^\t-\r )])[^\t-\r )\xc2\xe1-\xe3\xef]*/.source + '(?:(?!(?:' + BYTE_SPACE.source + '))' +
-  /[\xc2\xe1-\xe3\xef][^\t-\r )\xc2\xe1-\xe3\xef]*/.source + ')*', '');
-const INLINE_UTF16 = inlinePattern(/[^\s)]+/.source, '\\ud800-\\udfff');
+const ENTITY_TEXT = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" };
 
-function inlineRenderer(link, latin1) {
-  const pattern = latin1 ? INLINE_BYTES : INLINE_UTF16;
-  const render = (text) => text.replace(pattern, replace);
-  const innerMarks = latin1 ? /[&<>"'\\`*\[\x00-\x1f]/ : /[&<>"'\\`*\[\x00-\x1f\ud800-\udfff]/;
-  const inner = (text) => innerMarks.test(text) ? render(text) : text;
-  function replace(mark) {
-    const c = mark.charCodeAt(0);
-    if (mark.length === 1) {
-      return INLINE_ESCAPE[c] ?? ('\\u' + c.toString(16));
+function unescapeHtml(text) {
+  return text.includes('&') ? text.replace(/&(?:amp|lt|gt|quot|#39);/g, (entity) => ENTITY_TEXT[entity]) : text;
+}
+
+const INLINE_MARK = /[\\`*\[]/g;
+const ESCAPABLE = '\\`*_[]()#+.!-';
+// Delimiters around plain text can be consumed without another inline pass.
+const SIMPLE_STRONG = /[^*\\`\[]+\*\*/y;
+const SIMPLE_EMPHASIS = /[^*\\`\[]+\*(?!\*)/y;
+const SIMPLE_LABEL = /[^\]\\`*\[]*\]\(/y;
+
+function findCloser(text, mark, from, singleStar = false) {
+  let close = text.indexOf(mark, from);
+  while (close !== -1) {
+    // Consecutive backslashes escape each other in pairs. The scan starts
+    // inside the current construct, so earlier backslashes do not count.
+    let slash = close;
+    while (slash > from && text.charCodeAt(slash - 1) === 92) slash--;
+    if ((close - slash) % 2 === 0) {
+      if (!singleStar || text.charCodeAt(close + 1) !== 42) return close;
+      close++;
     }
-    if (c === 92) return INLINE_ESCAPE[mark.charCodeAt(1)] ?? mark[1];
-    if (c === 96) return '<code>' + htmlJson(mark.slice(1, -1), latin1) + '</code>';
-    if (c === 42) {
-      if (mark.length === 2) return mark;
-      if (mark.charCodeAt(1) === 42) return '<strong>' + inner(mark.slice(2, -2)) + '</strong>';
-      return '<em>' + inner(mark.slice(1, -1)) + '</em>';
-    }
-    let close = mark.indexOf('](');
-    // An escaped bracket can resemble the delimiter inside the label.
-    if (mark.charCodeAt(close - 1) === 92) {
-      close = /\[(?:[^\\\]]|\\(?:[\\\]]|(?![\\\]])))*\]/.exec(mark)[0].length - 1;
-    }
-    return '<a href=\\"' + link(mark.slice(close + 2, -1)) + '\\">' + inner(mark.slice(1, close)) + '</a>';
+    close = text.indexOf(mark, close + 1);
   }
-  return render;
+  return -1;
+}
+
+function renderInline(text, link, latin1) {
+  let out = '';
+  let copied = 0;
+  INLINE_MARK.lastIndex = 0;
+  while (INLINE_MARK.test(text)) {
+    const at = INLINE_MARK.lastIndex - 1;
+    let after = at + 1;
+    let html;
+    switch (text.charCodeAt(at)) {
+      case 92:
+        // A raw > is escapable and has already become an entity.
+        if (after < text.length && (ESCAPABLE.includes(text[after]) || text.startsWith('&gt;', after))) html = '';
+        break;
+      case 96: {
+        const close = text.indexOf('`', after);
+        if (close > after) {
+          html = '<code>' + text.slice(after, close) + '</code>';
+          after = close + 1;
+        }
+        break;
+      }
+      case 42: {
+        const strong = text.charCodeAt(after) === 42;
+        if (strong) after++;
+        const simple = strong ? SIMPLE_STRONG : SIMPLE_EMPHASIS;
+        simple.lastIndex = after;
+        const plain = simple.test(text);
+        const width = strong ? 2 : 1;
+        const close = plain ? simple.lastIndex - width : findCloser(text, strong ? '**' : '*', after, !strong);
+        if (close > after) {
+          const child = text.slice(after, close);
+          const inner = plain ? child : renderInline(child, link, latin1);
+          html = strong ? '<strong>' + inner + '</strong>' : '<em>' + inner + '</em>';
+          after = close + width;
+        }
+        break;
+      }
+      case 91: {
+        SIMPLE_LABEL.lastIndex = after;
+        const plain = SIMPLE_LABEL.test(text);
+        const labelEnd = plain ? SIMPLE_LABEL.lastIndex - 2 : findCloser(text, ']', after);
+        if (labelEnd === -1 || text.charCodeAt(labelEnd + 1) !== 40) break;
+        const close = text.indexOf(')', labelEnd + 2);
+        if (close <= labelEnd + 2) break;
+        const target = text.slice(labelEnd + 2, close);
+        if (hasSpace(target, latin1)) break;
+        const href = link(target);
+        const label = text.slice(after, labelEnd);
+        html = '<a href="' + href + '">' + (plain ? label : renderInline(label, link, latin1)) + '</a>';
+        after = close + 1;
+        break;
+      }
+    }
+    if (html !== undefined) {
+      out += text.slice(copied, at) + html;
+      copied = after;
+      // An escaped structural character is copied with the literal text.
+      INLINE_MARK.lastIndex = html === '' ? after + 1 : after;
+    } else if (after > at + 1) {
+      INLINE_MARK.lastIndex = after;
+    }
+  }
+  return copied === 0 ? text : out + text.slice(copied);
 }
 
 const FENCE = 7;
 const BREAK = 8;
 const BLANK = 9;
 
-function blockStart(line, separator) {
-  const first = line.charCodeAt(0);
+function blockStart(body, at, end, separator) {
+  if (at === end) return BLANK;
+  const first = body.charCodeAt(at);
+  if (first > 45 && first !== 96) return 0;
   if (first === 35) {
-    let level = 1;
-    while (line.charCodeAt(level) === 35) level++;
-    const next = line.charCodeAt(level);
-    if (level <= 6 && (next === 32 || next === 9) && !onlyIndent(line, level + 1)
-      && !separator.test(line)) return level;
-  } else if (first === 96 && line.charCodeAt(1) === 96 && line.charCodeAt(2) === 96) {
-    let i = 3;
-    for (; i < line.length; i++) {
-      const c = line.charCodeAt(i);
+    let text = at + 1;
+    while (body.charCodeAt(text) === 35) text++;
+    const level = text - at;
+    const next = body.charCodeAt(text);
+    if (level <= 6 && (next === 32 || next === 9) && !onlyIndent(body, text + 1, end)
+      && !separator.test(body.slice(text, end))) return level;
+  } else if (first === 96 && body.startsWith('```', at)) {
+    let i = at + 3;
+    for (; i < end; i++) {
+      const c = body.charCodeAt(i);
       const lower = c | 32;
       if ((lower >= 97 && lower <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) continue;
       break;
     }
-    if (onlyIndent(line, i)) return FENCE;
-  } else if ((first === 45 || first === 42) && line.charCodeAt(1) === first
-    && line.charCodeAt(2) === first && onlyIndent(line, 3)) {
+    if (onlyIndent(body, i, end)) return FENCE;
+  } else if ((first === 45 || first === 42) && body.charCodeAt(at + 1) === first
+    && body.charCodeAt(at + 2) === first && onlyIndent(body, at + 3, end)) {
     return BREAK;
-  } else if (line.length === 0 || ((first === 32 || first === 9) && onlyIndent(line, 1))) {
+  } else if ((first === 32 || first === 9) && onlyIndent(body, at + 1, end)) {
     return BLANK;
   }
   return 0;
@@ -314,83 +364,120 @@ function continuesList(line, latin1) {
   return space === null || space.index !== 0;
 }
 
-function renderMarkdown(body, link, latin1) {
-  const inline = inlineRenderer(link, latin1);
-  const lines = body.split('\n');
-  const separator = latin1 ? BYTE_SEPARATOR : SEPARATOR;
+function lineEnd(body, at) {
+  const end = body.indexOf('\n', at);
+  return end === -1 ? body.length : end;
+}
+
+function renderMarkdown(source, link, latin1) {
+  const body = escapeHtml(source);
+  const separator = latin1 ? MARKDOWN_BYTE_SEPARATOR : MARKDOWN_SEPARATOR;
   const ids = new Set();
   const toc = [];
-  const blocks = [];
+  let html = '';
   let excerpt = null;
   let at = 0;
-  let kind = blockStart(lines[0], separator);
+  let end = lineEnd(body, at);
+  let kind = blockStart(body, at, end, separator);
 
-  while (at < lines.length) {
-    const line = lines[at++];
+  while (at <= body.length) {
     if (kind === FENCE) {
-      const language = trimLine(line.slice(3));
-      blocks.push(language ? '<pre><code class=\\"language-' + language + '\\">' : '<pre><code>');
-      while (at < lines.length) {
-        const code = lines[at++];
-        if (code.startsWith('```') && onlyIndent(code, 3)) break;
-        blocks.push(htmlJson(code, latin1) + '\\n');
+      const language = trimLine(body.slice(at + 3, end));
+      const open = language ? '<pre><code class="language-' + language + '">' : '<pre><code>';
+      const start = end + 1;
+      let fence = body.indexOf('\n```', end);
+      while (fence !== -1) {
+        end = lineEnd(body, fence + 1);
+        if (onlyIndent(body, fence + 4, end)) break;
+        fence = body.indexOf('\n```', end);
       }
-      blocks.push('</code></pre>\\n');
+      let code = '';
+      if (fence !== -1) code = body.slice(start, fence + 1);
+      else if (start <= body.length) code = body.slice(start) + '\n';
+      html += open + code + '</code></pre>\n';
+      at = fence === -1 ? body.length + 1 : end + 1;
     } else if (kind === BREAK) {
-      blocks.push('<hr>\\n');
+      html += '<hr>\n';
+      at = end + 1;
     } else if (kind > 0 && kind < FENCE) {
-      const heading = trimLine(line.slice(kind));
-      const id = reserveSlug(slugify(heading, latin1), ids);
-      const text = inline(heading);
-      blocks.push('<h' + kind + ' id=\\"' + id + '\\">' + text + '</h' + kind + '>\\n');
+      const heading = trimLine(body.slice(at + kind, end));
+      const id = reserveSlug(slugify(unescapeHtml(heading), latin1), ids);
+      const text = renderInline(heading, link, latin1);
+      html += '<h' + kind + ' id="' + id + '">' + text + '</h' + kind + '>\n';
       if (kind === 2 || kind === 3) toc.push({ level: kind, id, html: new RenderedString(text) });
-    } else if (kind !== BLANK) {
-      if (line.charCodeAt(0) === 62) {
-        let content = trimLine(line.slice(1));
-        while (at < lines.length && lines[at].charCodeAt(0) === 62) {
-          const next = trimLine(lines[at++].slice(1));
-          if (next) content = content ? content + '\n' + next : next;
-        }
-        blocks.push('<blockquote>\\n');
-        if (content) blocks.push('<p>' + inline(content) + '</p>\\n');
-        blocks.push('</blockquote>\\n');
-      } else {
-        const marker = listMarker(line, separator);
-        if (marker) {
-          const ordered = marker !== 2;
-          const tag = ordered ? 'ol' : 'ul';
-          const first = ordered ? Number(line.slice(0, marker - 2)) : 1;
-          blocks.push(first !== 1 ? '<ol start=\\"' + first + '\\">\\n' : '<' + tag + '>\\n');
-          let item = trimLine(line.slice(marker));
-          while (at < lines.length) {
-            const next = lines[at];
-            const prefix = listMarker(next, separator);
-            if ((ordered && prefix > 2) || (!ordered && prefix === 2)) {
-              blocks.push('<li>' + inline(item) + '</li>\\n');
-              item = trimLine(next.slice(prefix));
-            } else if (continuesList(next, latin1)) {
-              item += '\n' + trimLine(next);
-            } else {
-              break;
-            }
-            at++;
+      at = end + 1;
+    } else if (kind === BLANK) {
+      at = end + 1;
+      while (body.charCodeAt(at) === 10) at++;
+    } else if (body.charCodeAt(at) === 38 && body.startsWith('&gt;', at)) {
+      // An actual '>' becomes '&gt;' while a literal '&gt;' becomes '&amp;gt;'.
+      let content = '';
+      do {
+        const next = trimLine(body.slice(at + 4, end));
+        if (next) content = content ? content + '\n' + next : next;
+        at = end + 1;
+        end = lineEnd(body, at);
+      } while (body.startsWith('&gt;', at));
+      html += content
+        ? '<blockquote>\n<p>' + renderInline(content, link, latin1) + '</p>\n</blockquote>\n'
+        : '<blockquote>\n</blockquote>\n';
+      kind = blockStart(body, at, end, separator);
+      continue;
+    } else {
+      const first = body.charCodeAt(at);
+      const marker = first === 42 || first === 45 || (first >= 48 && first <= 57)
+        ? listMarker(body.slice(at, end), separator) : 0;
+      if (marker) {
+        const ordered = marker !== 2;
+        const tag = ordered ? 'ol' : 'ul';
+        const start = ordered ? Number(body.slice(at, at + marker - 2)) : 1;
+        html += start !== 1 ? '<ol start="' + start + '">\n' : '<' + tag + '>\n';
+        let item = trimLine(body.slice(at + marker, end));
+        at = end + 1;
+        while (at <= body.length) {
+          end = lineEnd(body, at);
+          const next = body.slice(at, end);
+          const prefix = listMarker(next, separator);
+          if ((ordered && prefix > 2) || (!ordered && prefix === 2)) {
+            html += '<li>' + renderInline(item, link, latin1) + '</li>\n';
+            item = trimLine(next.slice(prefix));
+          } else if (continuesList(next, latin1)) {
+            item += '\n' + trimLine(next);
+          } else {
+            break;
           }
-          blocks.push('<li>' + inline(item) + '</li>\\n</' + tag + '>\\n');
-        } else {
-          let paragraph = trimLine(line);
-          while (at < lines.length && (kind = blockStart(lines[at], separator)) === 0) {
-            paragraph += '\n' + trimLine(lines[at++]);
-          }
-          const text = inline(paragraph);
-          excerpt ??= text;
-          blocks.push('<p>' + text + '</p>\\n');
-          continue;
+          at = end + 1;
         }
+        html += '<li>' + renderInline(item, link, latin1) + '</li>\n</' + tag + '>\n';
+        kind = blockStart(body, at, end, separator);
+        continue;
       }
+      // Keep consecutive untrimmed lines in a single slice of the body.
+      let from = at;
+      let paragraph = '';
+      let last;
+      do {
+        const head = body.charCodeAt(at);
+        const tail = body.charCodeAt(end - 1);
+        if (head === 32 || head === 9 || tail === 32 || tail === 9) {
+          paragraph += body.slice(from, at) + trimLine(body.slice(at, end));
+          from = end;
+        }
+        last = end;
+        at = end + 1;
+        if (at > body.length) break;
+        end = lineEnd(body, at);
+        kind = blockStart(body, at, end, separator);
+      } while (kind === 0);
+      const text = renderInline(paragraph + body.slice(from, last), link, latin1);
+      excerpt ??= text;
+      html += '<p>' + text + '</p>\n';
+      continue;
     }
-    if (at < lines.length) kind = blockStart(lines[at], separator);
+    end = lineEnd(body, at);
+    kind = blockStart(body, at, end, separator);
   }
-  return { content: new RenderedString(blocks.join('')), toc, excerpt: new RenderedString(excerpt ?? '') };
+  return { content: new RenderedString(html), toc, excerpt: new RenderedString(excerpt ?? '') };
 }
 
 const TEMPLATE_PATH = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
@@ -488,7 +575,7 @@ function property(value, name) {
 }
 
 function outputValue(value, raw, latin1) {
-  if (value instanceof RenderedString) return raw ? value.json : htmlJson(value.plain(), latin1);
+  if (value instanceof RenderedString) return raw ? value.json : jsonText(escapeHtml(value.plain()));
   switch (typeof value) {
     case 'string': return raw ? jsonText(value) : htmlJson(value, latin1);
     case 'number': return String(value);
@@ -718,13 +805,14 @@ function sourceDir(path) {
 
 const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
-function linkResolver(source, sources, statics, broken, base, latin1) {
+function linkResolver(source, sources, statics, broken, base) {
   const dir = sourceDir(source.path);
   const directory = dir === '' ? [] : dir.split('/');
   const targets = new Map();
-  return (target) => {
-    const cached = targets.get(target);
+  return (escapedTarget) => {
+    const cached = targets.get(escapedTarget);
     if (cached !== undefined) return cached;
+    const target = unescapeHtml(escapedTarget);
     let href = target;
     if (target[0] !== '/' && target[0] !== '#' && !URI_SCHEME.test(target)) {
       const hash = target.indexOf('#');
@@ -750,16 +838,30 @@ function linkResolver(source, sources, statics, broken, base, latin1) {
       else if (statics.has(path)) href = base + '/' + path + fragment;
       else broken.add('broken-link ' + source.path + ' -> ' + target);
     }
-    const escaped = htmlJson(href, latin1);
-    targets.set(target, escaped);
+    const escaped = href === target ? escapedTarget : /[&<>"']/.test(href) ? escapeHtml(href) : href;
+    targets.set(escapedTarget, escaped);
     return escaped;
   };
+}
+
+function hasUnicodeByteSpace(body) {
+  // Most bodies have none of these byte sequences. Search the fixed ones
+  // directly and inspect the final byte only for the shared U+20xx prefix.
+  if (body.includes('\xc2\xa0') || body.includes('\xe1\x9a\x80') || body.includes('\xe2\x81\x9f')
+    || body.includes('\xe3\x80\x80') || body.includes('\xef\xbb\xbf')) return true;
+  let i = body.indexOf('\xe2\x80');
+  while (i !== -1) {
+    const tail = body.charCodeAt(i + 2);
+    if ((tail >= 0x80 && tail <= 0x8a) || tail === 0xa8 || tail === 0xa9 || tail === 0xaf) return true;
+    i = body.indexOf('\xe2\x80', i + 3);
+  }
+  return false;
 }
 
 function readingMinutes(body, latin1) {
   // The number of matches is ceil(words / 200). In byte mode every
   // Unicode whitespace character has one of the sequences in BYTE_SPACE.
-  if (latin1 && !BYTE_SPACE.test(body)) {
+  if (latin1 && !hasUnicodeByteSpace(body)) {
     return Math.max(1, body.match(/[^\t-\r ]+(?:[\t-\r ]+[^\t-\r ]+){0,199}/g)?.length ?? 0);
   }
   if (latin1) body = decode(body);
@@ -874,7 +976,7 @@ function run(input, opts) {
   const staticPaths = new Set(statics.map((file) => file.path));
   const broken = new Set();
   for (const source of sources) {
-    const link = linkResolver(source, byPath, staticPaths, broken, base, latin1);
+    const link = linkResolver(source, byPath, staticPaths, broken, base);
     source.markdown = renderMarkdown(source.body, link, latin1);
   }
 
