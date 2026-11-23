@@ -203,9 +203,6 @@ class RenderedString {
   }
 }
 
-const ESCAPABLE = new Uint8Array(128);
-for (const c of '\\`*_[]()#+-.!>') ESCAPABLE[c.charCodeAt(0)] = 1;
-
 const INLINE_ESCAPE = JSON_CHAR.slice();
 INLINE_ESCAPE[34] = '&quot;';
 INLINE_ESCAPE[38] = '&amp;';
@@ -214,87 +211,50 @@ INLINE_ESCAPE[60] = '&lt;';
 INLINE_ESCAPE[62] = '&gt;';
 INLINE_ESCAPE[92] = '\\\\';
 
-function closingMark(text, mark, start, singleStar = false) {
-  let position = text.indexOf(mark, start);
-  while (position !== -1) {
-    let previous = position - 1;
-    while (previous >= start && text.charCodeAt(previous) === 92) previous--;
-    // Both possible closing characters are backslash-escapable.
-    const escaped = ((position - previous) & 1) === 0;
-    if (!escaped && (!singleStar || text.charCodeAt(position + 1) !== 42)) return position;
-    position = text.indexOf(mark, position + (!escaped && singleStar ? 2 : 1));
-  }
-  return -1;
+function inlinePattern(target, surrogate) {
+  // A delimiter search skips escaped marks. Emphasis also skips pairs of
+  // stars. A failed strong opener consumes its pair of stars as literal text.
+  const strong = /\*\*(?!\*\*)[^\\*]*(?:(?:\\(?:[\\*]|(?![\\*]))|\*(?!\*))[^\\*]*)*\*\*|\*\*/;
+  const emphasis = /\*[^\\*]*(?:(?:\\(?:[\\*]|(?![\\*]))|\*\*)[^\\*]*)*\*(?!\*)/;
+  const linkStart = /\[[^\\\]]*(?:\\(?:[\\\]]|(?![\\\]]))[^\\\]]*)*\]\(/;
+  return new RegExp(
+    /\\[\\`*_\[\]()#+.!>\-]|`[^`]+`/.source + '|' +
+    strong.source + '|' + emphasis.source + '|' + linkStart.source + target + '\\)|' +
+    '[&<>"\'\\\\\\x00-\\x1f' + surrogate + ']', 'g');
 }
 
-function inline(text, link, latin1, find) {
-  let parts;
-  let start = 0;
-  for (let i = 0; i < text.length; i++) {
-    find.lastIndex = i;
-    if (!find.test(text)) break;
-    i = find.lastIndex - 1;
-    const c = text.charCodeAt(i);
-    let replacement;
-    let end = i;
-    switch (c) {
-      case 92: {
-        const escaped = text.charCodeAt(i + 1);
-        if (ESCAPABLE[escaped]) {
-          replacement = INLINE_ESCAPE[escaped] ?? text[i + 1];
-          end++;
-        } else replacement = INLINE_ESCAPE[92];
-        break;
-      }
-      case 96: {
-        const close = text.indexOf('`', i + 1);
-        if (close > i + 1) {
-          replacement = '<code>' + htmlJson(text.slice(i + 1, close), latin1) + '</code>';
-          end = close;
-        }
-        break;
-      }
-      case 42: {
-        const strong = text.charCodeAt(i + 1) === 42;
-        const inner = i + (strong ? 2 : 1);
-        const close = strong ? closingMark(text, '**', inner) : closingMark(text, '*', inner, true);
-        if (close > inner) {
-          const name = strong ? 'strong' : 'em';
-          replacement = '<' + name + '>' + inline(text.slice(inner, close), link, latin1, find) + '</' + name + '>';
-          end = close + (strong ? 1 : 0);
-        } else if (strong) {
-          i++;
-        }
-        break;
-      }
-      case 91: {
-        const close = closingMark(text, ']', i + 1);
-        if (close >= 0 && text.charCodeAt(close + 1) === 40) {
-          const stop = text.indexOf(')', close + 2);
-          if (stop > close + 2) {
-            const target = text.slice(close + 2, stop);
-            if (!hasSpace(target, latin1)) {
-              replacement = '<a href=\\"' + link(target) + '\\">'
-                + inline(text.slice(i + 1, close), link, latin1, find) + '</a>';
-              end = stop;
-            }
-          }
-        }
-        break;
-      }
-      default:
-        if (c <= 62) replacement = INLINE_ESCAPE[c];
-        else if (!latin1 && (c & 0xf800) === 0xd800) replacement = '\\u' + c.toString(16);
+// Scan ordinary target bytes in runs and check for Unicode whitespace at
+// the UTF-8 lead bytes that can start it.
+const INLINE_BYTES = inlinePattern(
+  /(?=[^\t-\r )])[^\t-\r )\xc2\xe1-\xe3\xef]*/.source + '(?:(?!(?:' + BYTE_SPACE.source + '))' +
+  /[\xc2\xe1-\xe3\xef][^\t-\r )\xc2\xe1-\xe3\xef]*/.source + ')*', '');
+const INLINE_UTF16 = inlinePattern(/[^\s)]+/.source, '\\ud800-\\udfff');
+
+function inlineRenderer(link, latin1) {
+  const pattern = latin1 ? INLINE_BYTES : INLINE_UTF16;
+  const render = (text) => text.replace(pattern, replace);
+  const innerMarks = latin1 ? /[&<>"'\\`*\[\x00-\x1f]/ : /[&<>"'\\`*\[\x00-\x1f\ud800-\udfff]/;
+  const inner = (text) => innerMarks.test(text) ? render(text) : text;
+  function replace(mark) {
+    const c = mark.charCodeAt(0);
+    if (mark.length === 1) {
+      return INLINE_ESCAPE[c] ?? ('\\u' + c.toString(16));
     }
-    if (replacement !== undefined) {
-      (parts ??= []).push(text.slice(start, i), replacement);
-      start = end + 1;
-      i = end;
+    if (c === 92) return INLINE_ESCAPE[mark.charCodeAt(1)] ?? mark[1];
+    if (c === 96) return '<code>' + htmlJson(mark.slice(1, -1), latin1) + '</code>';
+    if (c === 42) {
+      if (mark.length === 2) return mark;
+      if (mark.charCodeAt(1) === 42) return '<strong>' + inner(mark.slice(2, -2)) + '</strong>';
+      return '<em>' + inner(mark.slice(1, -1)) + '</em>';
     }
+    let close = mark.indexOf('](');
+    // An escaped bracket can resemble the delimiter inside the label.
+    if (mark.charCodeAt(close - 1) === 92) {
+      close = /\[(?:[^\\\]]|\\(?:[\\\]]|(?![\\\]])))*\]/.exec(mark)[0].length - 1;
+    }
+    return '<a href=\\"' + link(mark.slice(close + 2, -1)) + '\\">' + inner(mark.slice(1, close)) + '</a>';
   }
-  if (parts === undefined) return text;
-  parts.push(text.slice(start));
-  return parts.join('');
+  return render;
 }
 
 const FENCE = 7;
@@ -354,7 +314,8 @@ function continuesList(line, latin1) {
   return space === null || space.index !== 0;
 }
 
-function renderMarkdown(body, link, latin1, find) {
+function renderMarkdown(body, link, latin1) {
+  const inline = inlineRenderer(link, latin1);
   const lines = body.split('\n');
   const separator = latin1 ? BYTE_SEPARATOR : SEPARATOR;
   const ids = new Set();
@@ -380,7 +341,7 @@ function renderMarkdown(body, link, latin1, find) {
     } else if (kind > 0 && kind < FENCE) {
       const heading = trimLine(line.slice(kind));
       const id = reserveSlug(slugify(heading, latin1), ids);
-      const text = inline(heading, link, latin1, find);
+      const text = inline(heading);
       blocks.push('<h' + kind + ' id=\\"' + id + '\\">' + text + '</h' + kind + '>\\n');
       if (kind === 2 || kind === 3) toc.push({ level: kind, id, html: new RenderedString(text) });
     } else if (kind !== BLANK) {
@@ -391,7 +352,7 @@ function renderMarkdown(body, link, latin1, find) {
           if (next) content = content ? content + '\n' + next : next;
         }
         blocks.push('<blockquote>\\n');
-        if (content) blocks.push('<p>' + inline(content, link, latin1, find) + '</p>\\n');
+        if (content) blocks.push('<p>' + inline(content) + '</p>\\n');
         blocks.push('</blockquote>\\n');
       } else {
         const marker = listMarker(line, separator);
@@ -405,7 +366,7 @@ function renderMarkdown(body, link, latin1, find) {
             const next = lines[at];
             const prefix = listMarker(next, separator);
             if ((ordered && prefix > 2) || (!ordered && prefix === 2)) {
-              blocks.push('<li>' + inline(item, link, latin1, find) + '</li>\\n');
+              blocks.push('<li>' + inline(item) + '</li>\\n');
               item = trimLine(next.slice(prefix));
             } else if (continuesList(next, latin1)) {
               item += '\n' + trimLine(next);
@@ -414,13 +375,13 @@ function renderMarkdown(body, link, latin1, find) {
             }
             at++;
           }
-          blocks.push('<li>' + inline(item, link, latin1, find) + '</li>\\n</' + tag + '>\\n');
+          blocks.push('<li>' + inline(item) + '</li>\\n</' + tag + '>\\n');
         } else {
           let paragraph = trimLine(line);
           while (at < lines.length && (kind = blockStart(lines[at], separator)) === 0) {
             paragraph += '\n' + trimLine(lines[at++]);
           }
-          const text = inline(paragraph, link, latin1, find);
+          const text = inline(paragraph);
           excerpt ??= text;
           blocks.push('<p>' + text + '</p>\\n');
           continue;
@@ -557,25 +518,25 @@ function collectDependencies(plans, slots = new Set()) {
 }
 
 function joinPlans(plans) {
-  const parts = [];
-  let text = '';
+  const strings = [''];
+  const renderers = [];
+  const slots = new Set();
   for (const plan of plans) {
     if (typeof plan === 'string') {
-      text += plan;
+      strings[strings.length - 1] += plan;
     } else {
-      if (text) parts.push(text);
-      text = '';
-      parts.push(plan);
+      renderers.push(plan);
+      strings.push('');
+      for (const slot of plan.slots) slots.add(slot);
     }
   }
-  if (parts.length === 0) return text;
-  if (text) parts.push(text);
-  if (parts.length === 1) return parts[0];
+  if (renderers.length === 0) return strings[0];
+  if (renderers.length === 1 && strings[0] === '' && strings[1] === '') return renderers[0];
   return {
-    slots: [...collectDependencies(parts)],
+    slots: [...slots],
     render(frame) {
-      let output = '';
-      for (const part of parts) output += renderPlan(part, frame);
+      let output = strings[0];
+      for (let i = 0; i < renderers.length; i++) output += renderers[i].render(frame) + strings[i + 1];
       return output;
     },
   };
@@ -912,10 +873,9 @@ function run(input, opts) {
 
   const staticPaths = new Set(statics.map((file) => file.path));
   const broken = new Set();
-  const find = latin1 ? /[&<>"'\\\x60*\[\x00-\x1f]/g : /[&<>"'\\\x60*\[\x00-\x1f\ud800-\udfff]/g;
   for (const source of sources) {
     const link = linkResolver(source, byPath, staticPaths, broken, base, latin1);
-    source.markdown = renderMarkdown(source.body, link, latin1, find);
+    source.markdown = renderMarkdown(source.body, link, latin1);
   }
 
   const posts = sources.filter((source) => source.post);
@@ -937,11 +897,11 @@ function run(input, opts) {
   const tagScope = templates.scope(['tag']);
   const emptyScope = templates.scope([]);
 
-  const files = [];
+  const files = ['{'];
   const written = new Set();
   const write = (path, escaped) => {
     written.add(path);
-    files.push(JSON.stringify(path) + ':"' + escaped + '"');
+    files.push(JSON.stringify(path), ':"', escaped, '",');
   };
   for (const source of sources) {
     const page = {
@@ -991,7 +951,8 @@ function run(input, opts) {
   report.push('built ' + (sources.length - posts.length) + ' pages, ' + posts.length + ' posts, '
     + tags.length + ' tags and ' + statics.length + ' static files');
   write('build-report.txt', jsonText(report.join('\n') + '\n'));
-  const answer = '{' + files.join(',') + '}';
+  files[files.length - 1] = '"}';
+  const answer = files.join('');
   return opts?.json ? answer : JSON.parse(answer);
 }
 
