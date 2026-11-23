@@ -1,6 +1,7 @@
 'use strict';
 
 const HIGH = /[^\x00-\x7f]/;
+const UNICODE_SPACE = /\s/;
 const ASCII_SPACE = /[\t-\r ]/;
 const ASCII_TRIM = /^[\t-\r ]+|[\t-\r ]+$/g;
 const BYTE_SPACE = /\xc2\xa0|\xe1\x9a\x80|\xe2\x80[\x80-\x8a\xa8\xa9\xaf]|\xe2\x81\x9f|\xe3\x80\x80|\xef\xbb\xbf/;
@@ -26,16 +27,21 @@ function trim(text, latin1) {
 }
 
 function hasSpace(text, latin1) {
-  return latin1 ? MARKDOWN_BYTE_SPACE.test(text) : /\s/.test(text);
+  return latin1 ? MARKDOWN_BYTE_SPACE.test(text) : UNICODE_SPACE.test(text);
 }
+
+const COMBINING_MARKS = /\p{M}/gu;
+const SLUG_SEPARATORS = /[^A-Za-z0-9]+/g;
 
 function slugify(text, latin1) {
   if (HIGH.test(text)) {
     if (latin1) text = decode(text);
-    text = text.normalize('NFKD').replace(/\p{M}/gu, '');
+    text = text.normalize('NFKD').replace(COMBINING_MARKS, '');
   }
-  return text.replace(/[^A-Za-z0-9]+/g, '-').toLowerCase().replace(/^-/, '')
-    .slice(0, 64).replace(/-$/, '') || 'untitled';
+  const slug = text.replace(SLUG_SEPARATORS, '-');
+  const start = slug.charCodeAt(0) === 45 ? 1 : 0;
+  const end = Math.min(slug.length, start + 64);
+  return slug.slice(start, slug.charCodeAt(end - 1) === 45 ? end - 1 : end).toLowerCase() || 'untitled';
 }
 
 function reserveSlug(slug, used) {
@@ -73,10 +79,14 @@ function onlyIndent(line, start = 0, end = line.length) {
   return true;
 }
 
+const QUOTED_SPECIAL = /["\\]/;
+
 function quotedValue(raw) {
   if (raw[0] === '[') throw 'a bare string opens on [';
   if (raw[0] !== '"') return raw;
   if (raw.length < 2 || raw.at(-1) !== '"') throw 'a quoted string is not closed';
+  const inner = raw.slice(1, -1);
+  if (!QUOTED_SPECIAL.test(inner)) return inner;
   let value = '';
   let start = 1;
   const end = raw.length - 1;
@@ -97,6 +107,11 @@ function quotedValue(raw) {
 
 const FRONT_KEYS = new Set(['title', 'summary', 'date', 'tags', 'draft', 'layout', 'slug']);
 const FRONT_LINE = /^([a-z_]+):(?: (.*))?$/;
+const DATE_FIELD = /^\d{4}-\d{2}-\d{2}$/;
+const INVALID_TAG = /["[\]]/;
+const LAYOUT_NAME = /^[a-z0-9-]+$/;
+const EXPLICIT_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const FRONT_PADDING = /[ \t]+$/;
 const BAD_DATE = 'not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)';
 
 function frontValue(key, raw, latin1) {
@@ -105,7 +120,7 @@ function frontValue(key, raw, latin1) {
     case 'summary':
       return quotedValue(raw);
     case 'date': {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) throw BAD_DATE;
+      if (!DATE_FIELD.test(raw)) throw BAD_DATE;
       const year = +raw.slice(0, 4);
       const month = +raw.slice(5, 7);
       const day = +raw.slice(8, 10);
@@ -118,11 +133,12 @@ function frontValue(key, raw, latin1) {
     case 'tags': {
       if (raw[0] !== '[' || raw.at(-1) !== ']') throw 'not a list [a, b]';
       const inner = raw.slice(1, -1);
-      if (!trim(inner, latin1)) return [];
+      if (inner === '') return [];
       const tags = inner.split(',');
       for (let i = 0; i < tags.length; i++) {
         const name = trim(tags[i], latin1);
-        if (!name || /["[\]]/.test(name)) throw 'an empty tag, or one holding " [ or ]';
+        if (name === '' && tags.length === 1) return [];
+        if (!name || INVALID_TAG.test(name)) throw 'an empty tag, or one holding " [ or ]';
         tags[i] = name;
       }
       return tags;
@@ -132,15 +148,43 @@ function frontValue(key, raw, latin1) {
       if (raw === 'false') return false;
       throw 'true or false';
     case 'layout':
-      if (/^[a-z0-9-]+$/.test(raw)) return raw;
+      if (LAYOUT_NAME.test(raw)) return raw;
       throw 'not a template name';
     case 'slug':
-      if (raw.length <= 64 && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(raw)) return raw;
+      if (raw.length <= 64 && EXPLICIT_SLUG.test(raw)) return raw;
       throw 'not a slug';
   }
 }
 
+// Fixed field order rules out duplicate or unknown keys.
+const ORDERED_FRONT = new RegExp(
+  String.raw`^---\n(?:#[^\n]*\n)?title: (.*[^ \t\n\r\u2028\u2029])\n`
+  + String.raw`(?:date: (\d{4}-\d\d-\d\d)\n)?(?:tags: (\[.*\])\n)?(?:draft: (true|false)\n)?`
+  + String.raw`(?:slug: ([a-z0-9]+(?:-[a-z0-9]+)*)\n)?(?:summary: (.*[^ \t\n\r\u2028\u2029])\n)?`
+  + String.raw`(?:layout: ([a-z0-9-]+)\n)?---(?:\n|$)`,
+);
+
 function frontMatter(text, latin1) {
+  const match = ORDERED_FRONT.exec(text);
+  if (match !== null && (!latin1 || !BYTE_SEPARATOR.test(match[0]))) {
+    const [, title, date, tags, draft, slug, summary, layout] = match;
+    if (slug === undefined || slug.length <= 64) {
+      try {
+        const data = { title: quotedValue(title), slug, layout };
+        if (date !== undefined) data.date = frontValue('date', date, latin1);
+        if (tags !== undefined) data.tags = frontValue('tags', tags, latin1);
+        if (draft !== undefined) data.draft = draft === 'true';
+        if (summary !== undefined) data.summary = quotedValue(summary);
+        return { data, body: text.slice(match[0].length) };
+      } catch {
+        // The general parser reports the first invalid field.
+      }
+    }
+  }
+  return parseFrontMatter(text, latin1);
+}
+
+function parseFrontMatter(text, latin1) {
   if (!text.startsWith('---\n')) return { error: text === '---' ? 'the front matter is not closed' : 'no front matter' };
   let close = 3;
   do {
@@ -194,26 +238,38 @@ function jsonText(text) {
   return JSON.stringify(text).slice(1, -1);
 }
 
+const RENDERED_JSON = Symbol();
+const RENDERED_TEXT = Symbol();
+
 class RenderedString {
   constructor(text) {
-    this.json = jsonText(text);
-    this.text = undefined;
+    this[RENDERED_JSON] = jsonText(text);
+    this[RENDERED_TEXT] = undefined;
   }
 
   plain() {
-    return this.text ??= JSON.parse('"' + this.json + '"');
+    return this[RENDERED_TEXT] ??= JSON.parse('"' + this[RENDERED_JSON] + '"');
   }
 }
 
+const AMPERSAND = /&/g;
+const LESS_THAN = /</g;
+const GREATER_THAN = />/g;
+const DOUBLE_QUOTE = /"/g;
+const APOSTROPHE = /'/g;
+
 function escapeHtml(text) {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  return text.replace(AMPERSAND, '&amp;').replace(LESS_THAN, '&lt;').replace(GREATER_THAN, '&gt;')
+    .replace(DOUBLE_QUOTE, '&quot;').replace(APOSTROPHE, '&#39;');
 }
 
+const HTML_ENTITY = /&(?:amp|lt|gt|quot|#39);/g;
 const ENTITY_TEXT = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" };
 
+const entityText = (entity) => ENTITY_TEXT[entity];
+
 function unescapeHtml(text) {
-  return text.includes('&') ? text.replace(/&(?:amp|lt|gt|quot|#39);/g, (entity) => ENTITY_TEXT[entity]) : text;
+  return text.includes('&') ? text.replace(HTML_ENTITY, entityText) : text;
 }
 
 const INLINE_MARK = /[\\`*\[]/g;
@@ -359,7 +415,7 @@ function continuesList(line, latin1) {
   if (i === line.length) return false;
   const next = line.charCodeAt(i);
   if (next < 128) return next < 9 || next > 13;
-  if (!latin1) return !/\s/.test(line[i]);
+  if (!latin1) return !UNICODE_SPACE.test(line[i]);
   const space = BYTE_SPACE.exec(line.slice(i));
   return space === null || space.index !== 0;
 }
@@ -569,26 +625,27 @@ function parseTemplate(name, source, latin1) {
 }
 
 function property(value, name) {
-  if (value !== null && typeof value === 'object' && !(value instanceof RenderedString) && Object.hasOwn(value, name)) {
+  if (value !== null && typeof value === 'object' && Object.hasOwn(value, name)) {
     return value[name];
   }
 }
 
 function outputValue(value, raw, latin1) {
-  if (value instanceof RenderedString) return raw ? value.json : jsonText(escapeHtml(value.plain()));
   switch (typeof value) {
     case 'string': return raw ? jsonText(value) : htmlJson(value, latin1);
     case 'number': return String(value);
     case 'boolean': return value ? 'true' : 'false';
     default:
+      if (value instanceof RenderedString) return raw ? value[RENDERED_JSON] : jsonText(escapeHtml(value.plain()));
       return Array.isArray(value) ? value.map((item) => outputValue(item, raw, latin1)).join(', ') : '';
   }
 }
 
 function truthy(value) {
-  if (value instanceof RenderedString) return value.json.length !== 0;
-  if (Array.isArray(value)) return value.length !== 0;
-  return value !== undefined && value !== null && value !== false && value !== '' && value !== 0;
+  if (!value) return Number.isNaN(value);
+  if (typeof value !== 'object') return true;
+  if (value instanceof RenderedString) return value[RENDERED_JSON].length !== 0;
+  return !Array.isArray(value) || value.length !== 0;
 }
 
 function renderPlan(plan, frame) {
@@ -652,6 +709,7 @@ class Templates {
     this.parsed = parsed;
     this.constants = constants;
     this.latin1 = latin1;
+    this.escapedStrings = new Map();
     this.free = new WeakMap();
     this.specializations = new WeakMap();
   }
@@ -793,8 +851,22 @@ class Templates {
     }
     const raw = node.kind === 'raw';
     const latin1 = this.latin1;
-    return read === undefined ? outputValue(value, raw, latin1)
-      : { slots: [slot], render: (frame) => outputValue(read(frame), raw, latin1) };
+    if (read === undefined) return outputValue(value, raw, latin1);
+    if (raw) return { slots: [slot], render: (frame) => outputValue(read(frame), true, latin1) };
+    const cache = this.escapedStrings;
+    return {
+      slots: [slot],
+      render(frame) {
+        const text = read(frame);
+        if (typeof text !== 'string' || text.length > 128) return outputValue(text, false, latin1);
+        let escaped = cache.get(text);
+        if (escaped === undefined) {
+          escaped = htmlJson(text, latin1);
+          cache.set(text, escaped);
+        }
+        return escaped;
+      },
+    };
   }
 }
 
@@ -803,42 +875,45 @@ function sourceDir(path) {
   return slash < 0 ? '' : path.slice(0, slash);
 }
 
+const HTML_PUNCTUATION = /[&<>"']/;
 const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
 function linkResolver(source, sources, statics, broken, base) {
   const dir = sourceDir(source.path);
-  const directory = dir === '' ? [] : dir.split('/');
-  const targets = new Map();
+  let directory;
+  let targets;
   return (escapedTarget) => {
+    const first = escapedTarget[0];
+    if (first === '#' || first === '/' || URI_SCHEME.test(escapedTarget)) return escapedTarget;
+    targets ??= new Map();
     const cached = targets.get(escapedTarget);
     if (cached !== undefined) return cached;
     const target = unescapeHtml(escapedTarget);
     let href = target;
-    if (target[0] !== '/' && target[0] !== '#' && !URI_SCHEME.test(target)) {
-      const hash = target.indexOf('#');
-      const relative = hash < 0 ? target : target.slice(0, hash);
-      const parts = directory.slice();
-      let valid = relative !== '';
-      for (const part of relative.split('/')) {
-        if (part === '' || part === '.') continue;
-        if (part === '..') {
-          if (parts.length === 0) {
-            valid = false;
-            break;
-          }
-          parts.pop();
-        } else {
-          parts.push(part);
+    const hash = target.indexOf('#');
+    const relative = hash < 0 ? target : target.slice(0, hash);
+    directory ??= dir === '' ? [] : dir.split('/');
+    const parts = directory.slice();
+    let valid = relative !== '';
+    for (const part of relative.split('/')) {
+      if (part === '' || part === '.') continue;
+      if (part === '..') {
+        if (parts.length === 0) {
+          valid = false;
+          break;
         }
+        parts.pop();
+      } else {
+        parts.push(part);
       }
-      const path = valid ? parts.join('/') : null;
-      const page = sources.get(path);
-      const fragment = hash < 0 ? '' : target.slice(hash);
-      if (page !== undefined) href = page.url + fragment;
-      else if (statics.has(path)) href = base + '/' + path + fragment;
-      else broken.add('broken-link ' + source.path + ' -> ' + target);
     }
-    const escaped = href === target ? escapedTarget : /[&<>"']/.test(href) ? escapeHtml(href) : href;
+    const path = valid ? parts.join('/') : null;
+    const page = sources.get(path);
+    const fragment = hash < 0 ? '' : target.slice(hash);
+    if (page !== undefined) href = page.url + fragment;
+    else if (statics.has(path)) href = base + '/' + path + fragment;
+    else broken.add('broken-link ' + source.path + ' -> ' + target);
+    const escaped = href === target ? escapedTarget : HTML_PUNCTUATION.test(href) ? escapeHtml(href) : href;
     targets.set(escapedTarget, escaped);
     return escaped;
   };
@@ -858,14 +933,19 @@ function hasUnicodeByteSpace(body) {
   return false;
 }
 
+const ASCII_WORD_GROUP = /[^\t-\r ]+(?:[\t-\r ]+[^\t-\r ]+){0,199}/g;
+const WORD_GROUP = /\S+(?:\s+\S+){0,199}/g;
+
 function readingMinutes(body, latin1) {
+  // A 201st word needs at least 401 code units including its separators.
+  if (body.length <= 400) return 1;
   // The number of matches is ceil(words / 200). In byte mode every
   // Unicode whitespace character has one of the sequences in BYTE_SPACE.
   if (latin1 && !hasUnicodeByteSpace(body)) {
-    return Math.max(1, body.match(/[^\t-\r ]+(?:[\t-\r ]+[^\t-\r ]+){0,199}/g)?.length ?? 0);
+    return Math.max(1, body.match(ASCII_WORD_GROUP)?.length ?? 0);
   }
   if (latin1) body = decode(body);
-  return Math.max(1, body.match(/\S+(?:\s+\S+){0,199}/g)?.length ?? 0);
+  return Math.max(1, body.match(WORD_GROUP)?.length ?? 0);
 }
 
 function linkRecord(source) {
@@ -917,9 +997,12 @@ function collectTags(posts, pages, base, latin1) {
   return [...tags.values()].sort((a, b) => b.posts.length - a.posts.length || compare(a.ref.slug, b.ref.slug));
 }
 
+const END_SLASHES = /\/+$/;
+const LINE_ENDINGS = /\r\n?/g;
+
 function run(input, opts) {
   const latin1 = opts?.latin1 === true;
-  const base = input.site.base_url.replace(/\/+$/, '');
+  const base = input.site.base_url.replace(END_SLASHES, '');
   const parsed = new Map();
   const report = [];
   const names = Object.keys(input.templates);
@@ -944,7 +1027,7 @@ function run(input, opts) {
       statics.push(file);
       continue;
     }
-    const front = frontMatter(content.includes('\r') ? content.replace(/\r\n?/g, '\n') : content, latin1);
+    const front = frontMatter(content.includes('\r') ? content.replace(LINE_ENDINGS, '\n') : content, latin1);
     const post = path.startsWith('posts/');
     const own = path.startsWith('tags/') ? 'tags' : path.startsWith('page/') ? 'page' : '';
     const layout = front.data?.layout ?? (post ? 'post' : 'page');
@@ -999,11 +1082,13 @@ function run(input, opts) {
   const tagScope = templates.scope(['tag']);
   const emptyScope = templates.scope([]);
 
-  const files = ['{'];
+  let files = '';
+  let comma = '{';
   const written = new Set();
   const write = (path, escaped) => {
     written.add(path);
-    files.push(JSON.stringify(path), ':"', escaped, '",');
+    files += comma + JSON.stringify(path) + ':"' + escaped + '"';
+    comma = ',';
   };
   for (const source of sources) {
     const page = {
@@ -1053,8 +1138,7 @@ function run(input, opts) {
   report.push('built ' + (sources.length - posts.length) + ' pages, ' + posts.length + ' posts, '
     + tags.length + ' tags and ' + statics.length + ' static files');
   write('build-report.txt', jsonText(report.join('\n') + '\n'));
-  files[files.length - 1] = '"}';
-  const answer = files.join('');
+  const answer = files + '}';
   return opts?.json ? answer : JSON.parse(answer);
 }
 
