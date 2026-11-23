@@ -1,4 +1,4 @@
-require('node:v8').setFlagsFromString('--no-incremental-marking --no-turbofan --always-sparkplug');
+require('node:v8').setFlagsFromString('--no-incremental-marking --no-turbofan --always-sparkplug --single-threaded-gc --semi-space-growth-factor=16');
 const { readFileSync, writeFileSync, openSync, closeSync, writeSync } = require('node:fs');
 const { run } = require('./solve.js');
 const input = (process.env.MAKEFUN_INPUT_DIR ?? '/input') + '/cases.json';
@@ -27,3 +27,5 @@ try {
 } finally {
   closeSync(fd);
 }
+// answers.json is written and closed: skip Node's environment and heap teardown.
+process.reallyExit(0);
