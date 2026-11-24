@@ -5,10 +5,17 @@ enum NodeKind { END, TEXT, GLOBAL_RUN, RAW, ESCAPED, TAG, FOR, IF, INCLUDE };
 enum PathRoot { FREE_NAME, LOOP_ITEM, LOOP_INFO };
 typedef struct {
     Str name;
-    enum Property *parts;
+    union {
+        byte short_parts[sizeof(void *)];
+        byte *long_parts;
+    };
     uint n;
     unsigned short root, up;
 } Path;
+static inline const byte *path_parts(const Path *path) {
+    return path->n <= COUNT(path->short_parts) ? path->short_parts : path->long_parts;
+}
+
 struct Node {
     enum NodeKind kind;
     int negate;
@@ -51,12 +58,13 @@ static int parse_path(Path *path, Str text) {
         if (text.p[end] != '.') return 0;
         i = end + 1;
     }
-    *path = (Path){.name = slice(text, 0, identifier_end(text, 0)),
-                   .parts = NEW(enum Property, count), .n = count};
+    *path = (Path){.name = slice(text, 0, identifier_end(text, 0)), .n = count};
+    byte *parts = path->short_parts;
+    if (count > COUNT(path->short_parts)) parts = path->long_parts = NEW(byte, count);
     size from = 0;
     for (size i = 0; i < count; i++) {
         size end = identifier_end(text, from);
-        path->parts[i] = property_id(slice(text, from, end));
+        parts[i] = property_id(slice(text, from, end));
         from = end + 1;
     }
     return 1;
@@ -203,8 +211,9 @@ struct Op {
     enum NodeKind kind;
     union { int negate; enum NodeKind original_kind; };
     Path path;
+    Str prefix;
     union {
-        struct { Str text; const GlobalRun *run; };
+        const GlobalRun *run;
         Template *include;
         struct {
             const Op *body;
@@ -215,37 +224,31 @@ struct Op {
 
 static const Value *site_path(const Op *op, const Value *site) {
     if ((op->kind == RAW || op->kind == ESCAPED) &&
-        op->path.root == FREE_NAME && op->path.n == 2 && op->path.parts[0] == PROP_SITE)
-        return property(site, op->path.parts[1]);
+        op->path.root == FREE_NAME && op->path.n == 2 && op->path.short_parts[0] == PROP_SITE)
+        return property(site, op->path.short_parts[1]);
     return 0;
 }
 
-// Site settings are immutable. Merge their interpolations with neighboring
-// literals when a template runs outside any scope that could shadow "site".
+// Site settings are immutable outside a scope that might shadow "site".
 static void prepare_global_runs(Op *ops, const Value *site) {
     for (Op *first = ops; first->kind != END;) {
+        const Value *setting = site_path(first, site);
+        if (!setting || (!first->prefix.n && !site_path(first + 1, site))) {
+            first++;
+            continue;
+        }
+        Buf text = {0};
         Op *end = first;
-        int setting = 0;
-        for (;;) {
-            if (end->kind != TEXT) {
-                if (!site_path(end, site)) break;
-                setting = 1;
-            }
-            end++;
-        }
-        if (setting && end > first + 1) {
-            Buf text = {0};
-            for (Op *op = first; op < end; op++) {
-                if (op->kind == TEXT) append(&text, op->text);
-                else write_value(&text, site_path(op, site), op->kind == RAW);
-            }
-            GlobalRun *run = NEW(GlobalRun, 1);
-            *run = (GlobalRun){take(&text), end - 1};
-            first->original_kind = first->kind;
-            first->kind = GLOBAL_RUN;
-            first->run = run;
-        }
-        first = end == first ? end + 1 : end;
+        do {
+            append(&text, end->prefix);
+            write_value(&text, setting, end->kind == RAW);
+        } while ((setting = site_path(++end, site)));
+        GlobalRun *run = NEW(GlobalRun, 1);
+        *run = (GlobalRun){take(&text), end - 1};
+        first->original_kind = first->kind;
+        first->kind = GLOBAL_RUN;
+        first->run = run;
+        first = end;
     }
 }
 
@@ -254,12 +257,18 @@ static void prepare_global_runs(Op *ops, const Value *site) {
 static Op *compile_nodes(const Node *nodes, const Map *templates, const Binding *bindings, const Value *site) {
     if (!nodes) return 0;
     size n = 0;
-    for (const Node *node = nodes; node; node = node->next) n++;
+    for (const Node *node = nodes; node; node = node->next) n += node->kind != TEXT;
     Op *ops = NEW(Op, n + 1);
     size i = 0;
-    for (const Node *node = nodes; node; node = node->next, i++) {
-        Op *op = &ops[i];
-        *op = (Op){.kind = node->kind, .path = node->path, .negate = node->negate};
+    Str prefix = {0};
+    for (const Node *node = nodes; node; node = node->next) {
+        if (node->kind == TEXT) {
+            prefix = prefix.n ? JOIN(prefix, node->text) : node->text;
+            continue;
+        }
+        Op *op = &ops[i++];
+        *op = (Op){.kind = node->kind, .path = node->path, .negate = node->negate, .prefix = prefix};
+        prefix = (Str){0};
         if (op->path.n) {
             for (const Binding *b = bindings; b; b = b->outer, op->path.up++) {
                 if (equal(op->path.name, S("loop"))) {
@@ -272,8 +281,7 @@ static Op *compile_nodes(const Node *nodes, const Map *templates, const Binding 
                 }
             }
         }
-        if (node->kind == TEXT) op->text = node->text;
-        else if (node->kind == INCLUDE) op->include = get(templates, node->text);
+        if (node->kind == INCLUDE) op->include = get(templates, node->text);
         else if (node->kind == FOR) {
             op->name = node->text;
             Binding binding = {node->text, bindings};
@@ -283,7 +291,7 @@ static Op *compile_nodes(const Node *nodes, const Map *templates, const Binding 
             op->alternative = compile_nodes(node->alternative, templates, bindings, site);
         }
     }
-    ops[n].kind = END;
+    ops[n] = (Op){.kind = END, .prefix = prefix};
     if (!bindings) prepare_global_runs(ops, site);
     return ops;
 }
@@ -303,6 +311,7 @@ struct Scope {
 
 static const Value *lookup(const Scope *scope, const Path *path) {
     for (uint up = path->up; up; up--) scope = scope->parent;
+    const byte *parts = path_parts(path);
     const Value *v;
     if (path->root != FREE_NAME) {
         v = path->root == LOOP_ITEM ? scope->item : scope->loop;
@@ -318,10 +327,10 @@ static const Value *lookup(const Scope *scope, const Path *path) {
             }
             scope = scope->parent;
         }
-        v = scope->properties[path->parts[0]];
+        v = scope->properties[parts[0]];
     }
 descend:
-    for (size i = 1; v && i < path->n; i++) v = property(v, path->parts[i]);
+    for (size i = 1; v && i < path->n; i++) v = property(v, parts[i]);
     return v;
 }
 
@@ -329,7 +338,7 @@ static int truthy(const Value *v) {
     if (!v) return 0;
     switch (v->kind) {
         case NIL: return 0;
-        case STRING: case LITERAL_STRING: return v->n != 0;
+        case STRING: case LITERAL_STRING: case PREPARED_STRING: return v->n != 0;
         case RENDERED: return v->n != 0;
         case NUMBER: case BOOLEAN: return v->number != 0;
         case ARRAY: return v->n != 0;
@@ -349,6 +358,12 @@ static void write_value(Buf *out, const Value *v, int raw) {
         case LITERAL_STRING:
             append(out, value_text(v));
             break;
+        case PREPARED_STRING:
+            if (!raw) {
+                append(out, (Str){v->prepared->escaped, v->prepared->length});
+                break;
+            }
+            __attribute__((fallthrough));
         case STRING:
             json(out, value_text(v), !raw, !raw && !latin1);
             break;
@@ -386,6 +401,8 @@ struct Memo {
     size local_scope, local_end;
     size local_length;
 };
+typedef struct { size key; Str text; } MemoItem;
+
 _Static_assert(PROP_URL < 64, "template property mask");
 
 static void add_free_name(Memo *memo, Path path, const Binding *bindings) {
@@ -395,7 +412,7 @@ static void add_free_name(Memo *memo, Path path, const Binding *bindings) {
     for (size i = 0; i < memo->count; i++) if (equal(name, memo->names[i])) return;
     if (memo->count == COUNT(memo->names)) memo->disabled = 1;
     else {
-        enum Property property = path.parts[0];
+        enum Property property = path_parts(&path)[0];
         memo->root_names |= 1UL << property;
         memo->properties[memo->count] = property;
         memo->names[memo->count++] = name;
@@ -470,8 +487,10 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
         }
     }
     if (item) {
-        size parts[] = {(size)item, binding_index};
-        Str key = {(const char *)parts, sizeof(parts)};
+        // The low three bits are available in an aligned Value pointer.
+        _Static_assert(_Alignof(Value) >= 8 && COUNT(memo->names) <= 8, "include cache key");
+        size item_key = (size)item | binding_index;
+        Str key = {(const char *)&item_key, sizeof(item_key)};
         const Str *saved = get(&memo->by_item, key);
         if (saved) {
             append(out, *saved);
@@ -481,9 +500,10 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
         render_ops(out, template->ops, scope, depth, stack_depth);
         Str text = cache_answer(out, start);
         if (text.p) {
-            Str *cached = NEW(Str, 1);
-            *cached = text;
-            set(&memo->by_item, JOIN(key), cached);
+            MemoItem *cached = NEW(MemoItem, 1);
+            cached->key = item_key;
+            cached->text = text;
+            set(&memo->by_item, (Str){(const char *)&cached->key, sizeof(cached->key)}, &cached->text);
         }
         return;
     }
@@ -521,20 +541,16 @@ static void render_loop(Buf *out, const Op *node, const Scope *scope, uint depth
 static void render_ops(Buf *out, const Op *ops, const Scope *scope, uint include_depth, uint stack_depth) {
     if (!ops) return;
     if (stack_depth > 512) fail();
-    for (const Op *node = ops; node->kind != END; node++) {
+    for (const Op *node = ops;; node++) {
+        if (node->kind == GLOBAL_RUN && !scope->parent) {
+            append(out, node->run->text);
+            node = node->run->last;
+            continue;
+        }
+        append(out, node->prefix);
         switch (node->kind) {
             case GLOBAL_RUN:
-                if (!scope->parent) {
-                    append(out, node->run->text);
-                    node = node->run->last;
-                } else if (node->original_kind == TEXT) {
-                    append(out, node->text);
-                } else {
-                    write_value(out, lookup(scope, &node->path), node->original_kind == RAW);
-                }
-                break;
-            case TEXT:
-                append(out, node->text);
+                write_value(out, lookup(scope, &node->path), node->original_kind == RAW);
                 break;
             case RAW: case ESCAPED:
                 write_value(out, lookup(scope, &node->path), node->kind == RAW);
@@ -551,8 +567,8 @@ static void render_ops(Buf *out, const Op *ops, const Scope *scope, uint include
                 if (node->include && include_depth < 8)
                     render_include(out, node->include, scope, include_depth + 1, stack_depth + 1);
                 break;
-            case TAG: case END:
-                fail();
+            case END: return;
+            case TEXT: case TAG: fail();
         }
     }
 }

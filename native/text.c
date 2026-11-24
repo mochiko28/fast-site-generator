@@ -257,6 +257,19 @@ Value template_text(Str s) {
     return next_json(s, 0, 1, latin1 ? 0 : 2) == s.n ? literal_string(s) : string(s);
 }
 
+Value prepare_text(Str s) {
+    Value v = template_text(s);
+    if (v.kind != STRING || s.n > 128) return v;
+    char local[128 * 6];
+    Buf out = {local, 0, sizeof(local)};
+    json(&out, s, 1, !latin1);
+    PreparedText *text = alloc(1, sizeof(*text) + out.n);
+    text->plain = s.p;
+    text->length = out.n;
+    copy(text->escaped, out.p, out.n);
+    return (Value){.kind = PREPARED_STRING, .prepared = text, .n = s.n};
+}
+
 static Str json_escape(int c) {
     switch (c) {
         case '\\': return S("\\\\");

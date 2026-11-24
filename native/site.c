@@ -26,11 +26,11 @@ static inline Str read_slice(InputSlice s) {
 }
 
 #define INPUT_CHUNK (128UL << 10)
-#define SCAN_CHUNK (256UL << 10)
 
 typedef struct {
     Str source;
     size pos, loaded, remaining;
+    unsigned encoding_flags;
     size utf8_overlap;  // Leading bytes validated by the previous refill.
 } Parser;
 typedef char Vec __attribute__((vector_size(16), aligned(1), may_alias));
@@ -38,13 +38,17 @@ typedef char Vec __attribute__((vector_size(16), aligned(1), may_alias));
 
 static int json_space(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
 
+static void *encoding_restart[5];
+static int has_unicode_escape(Str input, unsigned *flags);
+
 static __attribute__((noinline)) int refill(Parser *p, size i) {
     while (i >= p->source.n && p->remaining) {
         size n = p->remaining < INPUT_CHUNK ? p->remaining : INPUT_CHUNK;
         PHASE_BEGIN(previous, INPUT);
         char *bytes = (char *)p->source.p + p->source.n;
         size following = p->remaining - n;
-        size lookahead = latin1 ? 0 : (following < 3 ? following : 3);
+        size overlap = latin1 ? 5 : 3;
+        size lookahead = following < overlap ? following : overlap;
         read_input(bytes, n + lookahead, p->loaded);
         if (!latin1) {
             // Finish any code point that starts in this block with the lookahead.
@@ -52,6 +56,8 @@ static __attribute__((noinline)) int refill(Parser *p, size i) {
             while (end < n + lookahead && ((byte)bytes[end] & 0xc0) == 0x80) end++;
             validate_utf8((Str){bytes + p->utf8_overlap, end - p->utf8_overlap});
             p->utf8_overlap = end - n;
+        } else if (has_unicode_escape((Str){bytes, n + lookahead}, &p->encoding_flags)) {
+            __builtin_longjmp(encoding_restart, 1);
         }
         PHASE_END(previous);
         p->source.n += n;
@@ -140,30 +146,41 @@ static size json_mark(Str input, size i) {
 typedef char Wide __attribute__((vector_size(32), aligned(1), may_alias));
 #define SPLAT_WIDE(c) ((Wide){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c})
 
-static __attribute__((target("avx2"), noinline)) size unicode_escape_wide(Str input) {
+enum EncodingFlag { LOWERCASE_U = 1, WIDE_ESCAPE = 2 };
+static inline int encoding_escape(Str input, size i, unsigned *flags) {
+    unsigned lower = input.p[i + 1] == 'u';
+    unsigned wide = hex4(input, i + 2) >= 128;
+    *flags |= lower | (wide * WIDE_ESCAPE);
+    return *flags == (LOWERCASE_U | WIDE_ESCAPE);
+}
+
+static __attribute__((target("avx2"), noinline)) size unicode_escape_wide(Str input, unsigned *flags) {
     size i = 0;
     for (; input.n - i >= 33; i += 32) {
         Wide first = *(const Wide *)(input.p + i);
         Wide second = *(const Wide *)(input.p + i + 1);
-        uint hits = __builtin_ia32_pmovmskb256((first == SPLAT_WIDE('\\')) & (second == SPLAT_WIDE('u')));
+        uint hits = __builtin_ia32_pmovmskb256((first == SPLAT_WIDE('\\')) &
+            ((second | SPLAT_WIDE(32)) == SPLAT_WIDE('u')));
         for (; hits; hits &= hits - 1)
-            if (hex4(input, i + first_bit(hits) + 2) >= 128) return NPOS;
+            if (encoding_escape(input, i + first_bit(hits), flags)) return NPOS;
     }
     return i;
 }
 
-static int has_unicode_escape(Str input) {
-    size i = has_avx2 ? unicode_escape_wide(input) : 0;
+static int has_unicode_escape(Str input, unsigned *flags) {
+    size i = has_avx2 ? unicode_escape_wide(input, flags) : 0;
     if (i == NPOS) return 1;
     for (; input.n - i >= 17; i += 16) {
         Vec first = *(const Vec *)(input.p + i);
         Vec second = *(const Vec *)(input.p + i + 1);
-        uint hits = __builtin_ia32_pmovmskb128((first == SPLAT('\\')) & (second == SPLAT('u')));
+        uint hits = __builtin_ia32_pmovmskb128((first == SPLAT('\\')) &
+            ((second | SPLAT(32)) == SPLAT('u')));
         for (; hits; hits &= hits - 1)
-            if (hex4(input, i + first_bit(hits) + 2) >= 128) return 1;
+            if (encoding_escape(input, i + first_bit(hits), flags)) return 1;
     }
-    for (; i + 5 < input.n; i++)
-        if (input.p[i] == '\\' && input.p[i + 1] == 'u' && hex4(input, i + 2) >= 128) return 1;
+    for (; i + 1 < input.n; i++)
+        if (input.p[i] == '\\' && (input.p[i + 1] | 32) == 'u' &&
+            encoding_escape(input, i, flags)) return 1;
     return 0;
 }
 
@@ -192,6 +209,37 @@ static const Vec drop_lane[16] = {
     {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0}
 };
 
+// Compact up to two simple escapes in a fully loaded vector.
+// A zero result leaves the input for the general decoder.
+static inline __attribute__((target("avx2"))) int compact_json_vector(
+        char *write, const char *read, Vec block, uint hits, uint *cr) {
+    if (!hits) {
+        *(Vec *)write = block;
+        return 16;
+    }
+    uint n = first_bit(hits);
+    if (n == 15 || read[n] != '\\') return 0;
+    uint decoded = unescape[(byte)read[n + 1]];
+    if (!decoded) return 0;
+    uint remaining = hits & (-1u << (n + 2));
+    if (remaining) {
+        uint m = first_bit(remaining);
+        if (m == 15 || read[m] != '\\' || (hits >> (m + 2))) return 0;
+        uint second = unescape[(byte)read[m + 1]];
+        if (!second) return 0;
+        Vec first = __builtin_ia32_pshufb128(block, drop_lane[n + 1]);
+        *(Vec *)write = __builtin_ia32_pshufb128(first, drop_lane[m]);
+        write[n] = (byte)decoded;
+        write[m - 1] = (byte)second;
+        *cr |= decoded | second;
+        return 14;
+    }
+    *(Vec *)write = __builtin_ia32_pshufb128(block, drop_lane[n + 1]);
+    write[n] = (byte)decoded;
+    *cr |= decoded;
+    return 15;
+}
+
 static __attribute__((target("avx2"), noinline)) size copy_json_wide(
     Str input, size from, char **destination, uint *carriage_return, int *special) {
     char *write = *destination;
@@ -202,36 +250,26 @@ static __attribute__((target("avx2"), noinline)) size copy_json_wide(
     while (limit - read >= 16) {
         Vec block = *(const Vec *)read;
         uint hits = string_marks(block);
-        if (!hits) {
-            *(Vec *)write = block;
+        int copied = compact_json_vector(write, read, block, hits, &cr);
+        if (copied) {
             read += 16;
-            write += 16;
+            write += copied;
             continue;
         }
         uint n = first_bit(hits);
-        if (read[n] == '\\' && n < 15) {
-            uint decoded = unescape[(byte)read[n + 1]];
-            if (decoded) {
-                if (!(hits >> (n + 2))) {
-                    *(Vec *)write = __builtin_ia32_pshufb128(block, drop_lane[n + 1]);
-                    write[n] = (byte)decoded;
-                    write += 15;
-                    read += 16;
-                } else {
-                    if (read + n - write >= 16) *(Vec *)write = block;
-                    else copy(write, read, n);
-                    write[n] = (byte)decoded;
-                    write += n + 1;
-                    read += n + 2;
-                }
-                cr |= decoded;
-                continue;
-            }
-        }
         if (read + n - write >= 16) *(Vec *)write = block;
         else copy(write, read, n);
         write += n;
         read += n;
+        if (*read == '\\' && limit - read >= 2) {
+            uint decoded = unescape[(byte)read[1]];
+            if (decoded) {
+                *write++ = (byte)decoded;
+                read += 2;
+                cr |= decoded;
+                continue;
+            }
+        }
         *special = 1;
         goto done;
     }
@@ -450,7 +488,7 @@ static long as_integer(const Json *value) {
     return negative ? -n : n;
 }
 
-typedef struct { Str path, text; int has_cr; } File;
+typedef struct { Str path, text; int has_cr, written; } File;
 typedef struct Warning Warning;
 struct Warning { Str text; Warning *next; };
 
@@ -469,9 +507,9 @@ enum PageField {
 typedef struct Page Page;
 typedef struct TagEntry TagEntry;
 struct Page {
-    Str path, directory, output, body;
+    Str path, output, body;
     Str *tag_names;
-    size tag_count;
+    uint tag_count, directory_length;
     const Template *layout;
     int post;
     Value card, link, data;
@@ -489,12 +527,12 @@ struct TagEntry {
 
 typedef struct {
     Str base;
-    Map templates, sources, statics, directories, links, broken, written, tags, tag_slugs;
+    Map templates, sources, statics, directories, links, broken, tags, tag_slugs;
     Warning *warnings;
     size warning_count;
     TagEntry **tag_order;
     size tag_count;
-    int comma;
+    int comma, index_statics;  // Generated template paths all end in index.html.
 } Site;
 
 static void warn(Site *site, Str text) {
@@ -739,17 +777,19 @@ static void add_page(Site *site, Page *page, const File *file) {
         set(&site->directories, slug_dir, used);
     }
     Str slug = unique_slug(used, front.slug.n ? front.slug : slugify(front.title));
-    Str output_dir = slug_dir.n ? JOIN(slug_dir, S("/"), slug) : slug;
+    Str output_suffix = S("/index.html");
+    Str output = JOIN(slug_dir, slug_dir.n ? S("/") : (Str){0}, slug, output_suffix);
+    Str output_dir = slice(output, 0, output.n - output_suffix.n);
     *page = (Page){
-        .path = file->path, .directory = dir, .body = front.body, .post = post, .layout = t,
+        .path = file->path, .directory_length = dir.n, .body = front.body, .post = post, .layout = t,
         .tag_names = front.tag_names, .tag_count = front.tag_count,
-        .output = JOIN(output_dir, S("/index.html")),
+        .output = output,
     };
     Value *v = page->values;
-    v[P_TITLE] = template_text(front.title);
+    v[P_TITLE] = prepare_text(front.title);
     v[P_URL] = template_text(JOIN(site->base, S("/"), output_dir, S("/")));
     v[P_DATE] = literal_string(front.date);
-    v[P_SUMMARY] = template_text(front.summary);
+    v[P_SUMMARY] = prepare_text(front.summary);
     v[P_SLUG] = literal_string(slug);
     set(&site->sources, file->path, page);
     PHASE_END(front_phase);
@@ -767,34 +807,38 @@ static int scheme(Str target) {
     return 0;
 }
 
+// A slash followed by a slash or dot may need component normalization.
+static int path_needs_split(Str path) {
+    size i = 0;
+    for (; i + 16 < path.n; i += 16) {
+        Vec first = *(const Vec *)(path.p + i);
+        Vec second = *(const Vec *)(path.p + i + 1);
+        if (__builtin_ia32_pmovmskb128((first == SPLAT('/')) &
+            ((second | SPLAT(1)) == SPLAT('/')))) return 1;
+    }
+    for (; i + 1 < path.n; i++)
+        if (path.p[i] == '/' && (path.p[i + 1] | 1) == '/') return 1;
+    return 0;
+}
+
 static Str relative_path(Str dir, Str rel, char *storage, size capacity) {
     // Resolve canonical paths directly, dropping leading parent components.
     Str base = dir, rest = rel;
-    while (starts(rest, S("../"))) {
-        if (!base.n) break;
+    while (base.n && rest.n >= 3 && rest.p[0] == '.' && rest.p[1] == '.' && rest.p[2] == '/') {
         Str parent = directory(base);
-        if (!parent.n && at(base, 0) == '/') break;
+        if (!parent.n && base.p[0] == '/') break;
         base = parent;
         rest = tail(rest, 3);
     }
-    if (rest.n && at(rest, 0) != '/' && at(rest, rest.n - 1) != '/' &&
-        !equal(rest, S(".")) && !equal(rest, S("..")) &&
-        !starts(rest, S("./")) && !starts(rest, S("../")) &&
-        !ends(rest, S("/.")) && !ends(rest, S("/.."))) {
-        size i = 0;
-        while ((i = find_char(rest, i, '/')) != NPOS) {
-            Str suffix = tail(rest, ++i);
-            if (at(suffix, 0) == '/' || starts(suffix, S("./")) || starts(suffix, S("../"))) break;
-        }
-        if (i == NPOS) {
-            if (!base.n) return rest;
-            size bytes = base.n + 1 + rest.n;
-            char *out = bytes <= capacity ? storage : NEW(char, bytes);
-            copy(out, base.p, base.n);
-            out[base.n] = '/';
-            copy(out + base.n + 1, rest.p, rest.n);
-            return (Str){out, bytes};
-        }
+    if (rest.n && rest.p[0] != '/' && rest.p[0] != '.' && rest.p[rest.n - 1] != '/' &&
+        !path_needs_split(rest)) {
+        if (!base.n) return rest;
+        size bytes = base.n + 1 + rest.n;
+        char *out = bytes <= capacity ? storage : NEW(char, bytes);
+        copy(out, base.p, base.n);
+        out[base.n] = '/';
+        copy(out + base.n + 1, rest.p, rest.n);
+        return (Str){out, bytes};
     }
     Str initial[64];
     Str *parts = initial;
@@ -841,8 +885,9 @@ static Value link_target(void *context, Str target) {
     if (first == '/' || first == '#' || scheme(target)) return string(target);
     LinkContext *link = context;
     Site *site = link->site;
+    Str dir = {link->page->path.p, link->page->directory_length};
     if (!link->resolved) {
-        void **slot = entry_value(&site->links, link->page->directory);
+        void **slot = entry_value(&site->links, dir);
         if (!*slot) {
             Map *links = NEW(Map, 1);
             *links = (Map){0};
@@ -857,7 +902,7 @@ static Value link_target(void *context, Str target) {
     if (hash == NPOS) hash = target.n;
     Str frag = tail(target, hash);
     char path_bytes[256];
-    Str path = relative_path(link->page->directory, slice(target, 0, hash), path_bytes, sizeof(path_bytes));
+    Str path = relative_path(dir, slice(target, 0, hash), path_bytes, sizeof(path_bytes));
     Value resolved = string(target);
     if (path.p) {
         const Page *page = get(&site->sources, path);
@@ -895,7 +940,7 @@ static TagEntry *make_tag(Site *site, Str name, Str slug, int post) {
     *tag = (TagEntry){
         .slug = slug,
         .values = {
-            [T_NAME] = template_text(name), [T_SLUG] = literal_string(slug),
+            [T_NAME] = prepare_text(name), [T_SLUG] = literal_string(slug),
             [T_URL] = template_text(post ? JOIN(site->base, S("/tags/"), slug, S("/")) : S("")),
         },
     };
@@ -989,20 +1034,23 @@ static Value collect_tags(Site *site) {
     return array(metadata, n);
 }
 
-static void write_key(Site *site, Buf *out, Str path, int track) {
+static void write_key(Site *site, Buf *out, Str path) {
     PHASE_BEGIN(render_phase, SERIALIZE);
     if (site->comma) put(out, ',');
     site->comma = 1;
     put(out, '"');
     json(out, path, 0, 0);
     ADD(out, "\":\"");
-    if (track) set(&site->written, path, (void *)1);
     PHASE_END(render_phase);
 }
 
 static void write_template(Site *site, Buf *out, Str path, const Template *template,
                            const Value *locals, const Value *globals) {
-    write_key(site, out, path, 1);
+    if (site->index_statics) {
+        File *file = get(&site->statics, path);
+        if (file) file->written = 1;
+    }
+    write_key(site, out, path);
     render_template(out, template, locals, globals);
     put(out, '"');
 }
@@ -1035,10 +1083,13 @@ static void write_indexes(Site *site, Buf *out, const Template *template, const 
 static void write_statics(Site *site, Buf *out, File **files, size n) {
     for (size i = 0; i < n; i++) {
         const File *f = files[i];
-        if (get(&site->written, f->path)) {
+        // The map entry is shared by inputs with the same path.
+        File *file = get(&site->statics, f->path);
+        if (file->written) {
             warn(site, JOIN(S("shadowed "), f->path, S(": a built page has its path")));
         } else if (!equal(f->path, S("__proto__"))) {
-            write_key(site, out, f->path, 1);
+            file->written = 1;
+            write_key(site, out, f->path);
             json(out, f->text, 0, 0);
             put(out, '"');
         }
@@ -1050,7 +1101,7 @@ static void write_report(Site *site, Buf *out, size pages, size posts, size stat
     size i = 0;
     for (Warning *w = site->warnings; w; w = w->next) warnings[i++] = &w->text;
     sort((void **)warnings, i, string_order);
-    write_key(site, out, S("build-report.txt"), 0);
+    write_key(site, out, S("build-report.txt"));
     for (size j = 0; j < i; j++) {
         json(out, *warnings[j], 0, 0);
         ADD(out, "\\n");
@@ -1070,7 +1121,7 @@ static void build_site(Buf *out, const Json *input) {
     if (per_page <= 0) fail();
     while (base.n && base.p[base.n - 1] == '/') base.n--;
 
-    Value title_value = template_text(title), base_value = template_text(base);
+    Value title_value = prepare_text(title), base_value = template_text(base);
     const Value *site_fields[] = {&title_value, &base_value};
     Value site_value = record(SITE_FIELDS, site_fields, COUNT(site_fields));
 
@@ -1082,14 +1133,13 @@ static void build_site(Buf *out, const Json *input) {
     if (input_files->kind != JARRAY) fail();
     size n = input_files->count;
     reserve_map(&site.sources, n);
-    reserve_map(&site.written, n);
     File *data = NEW(File, n);
     File **files = NEW(File *, n);
     size i = 0;
     for (const Json *entry = input_files->child; entry; entry = entry->next, i++) {
         const Json *content = field(entry, S("content"));
         Str text = as_string(content);
-        data[i] = (File){as_string(field(entry, S("path"))), text, content->has_cr};
+        data[i] = (File){.path = as_string(field(entry, S("path"))), .text = text, .has_cr = content->has_cr};
         files[i] = &data[i];
     }
     sort((void **)files, n, file_order);
@@ -1114,6 +1164,7 @@ static void build_site(Buf *out, const Json *input) {
             if (p->post) posts[post_count++] = p;
         } else {
             set(&site.statics, f->path, f);
+            site.index_statics |= ends(f->path, S("index.html"));
             files[static_count++] = f;
         }
     }
@@ -1179,34 +1230,8 @@ static void build_site(Buf *out, const Json *input) {
     put(out, '}');
 }
 
-void build_answers(Buf *out, char *source, size length) {
-    // The encoding decision belongs to the entire batch. Keep escape detection
-    // bounded to the input window, with five bytes retained between reads.
-    input_base = source;
-    size first = length < INPUT_CHUNK ? length : INPUT_CHUNK;
-    size overlap = 0;
-    latin1 = 1;
-    // Read the first parser block last so it is ready to parse. Each block also
-    // sees five bytes from the block to its right for escapes across the boundary.
-    for (size end = length; end;) {
-        size base = end > first ? first + ((end - first - 1) & ~(SCAN_CHUNK - 1)) : 0;
-        size n = end - base;
-        read_input(source, n, base);
-        if (has_unicode_escape((Str){source, n + overlap})) {
-            latin1 = 0;
-            break;
-        }
-        if (base) {
-            overlap = n + overlap < 5 ? n + overlap : 5;
-            size preceding = base == first ? first : SCAN_CHUNK;
-            copy(source + preceding, source, overlap);
-        }
-        end = base;
-    }
-    // UTF-16 mode restarts at byte zero so all raw UTF-8 is validated on refill.
-    size scanned = latin1 ? first : 0;
-    Parser parser = {.source = {source, scanned}, .loaded = scanned, .remaining = length - scanned};
-
+static void parse_batch(Buf *out, char *source, size length) {
+    Parser parser = {.source = {source, 0}, .remaining = length};
     PHASE(PARSE);
     if (peek_batch(&parser) != '[') fail();
     parser.pos++;
@@ -1223,7 +1248,7 @@ void build_answers(Buf *out, char *source, size length) {
             if (peek_batch(&parser) != ',') break;
             parser.pos++;
             // No slice from the completed case is live after the arena rewind.
-            if (length > first) {
+            if (length > INPUT_CHUNK) {
                 size unread = parser.source.n - parser.pos;
                 copy(source, source + parser.pos, unread);
                 parser.source.n = unread;
@@ -1236,4 +1261,19 @@ void build_answers(Buf *out, char *source, size length) {
     parser.pos++;
     if (peek_batch(&parser) != -1) fail();
     put(out, ']');
+}
+
+void build_answers(Buf *out, char *source, size length) {
+    // Scan raw blocks before decoding them. Wide mode applies to the entire
+    // batch, so restart from byte zero if a later block changes the decision.
+    input_base = source;
+    size mark = checkpoint();
+    latin1 = 1;
+    if (__builtin_setjmp(encoding_restart)) {
+        rewind_arena(mark);
+        restart_answer();
+        latin1 = 0;
+    }
+    PHASE(INPUT);
+    parse_batch(out, source, length);
 }

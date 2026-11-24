@@ -10,7 +10,7 @@
 #ifndef SITE_OUTPUT_CAPACITY
 #define SITE_OUTPUT_CAPACITY (256UL << 10)
 #endif
-#define INCLUDE_CACHE_LIMIT (64UL << 10)
+#define INCLUDE_CACHE_LIMIT (80UL << 10)
 #define HTML_LIMIT SCRATCH_LIMIT
 #define INPUT_LIMIT SCRATCH_LIMIT
 #define MARKDOWN_TEXT_LIMIT SCRATCH_LIMIT
@@ -37,7 +37,7 @@ static void flush_answer(void);
 
 enum LinuxCall {
     SYS_READ = 0, SYS_WRITE = 1, SYS_OPEN = 2, SYS_CLOSE = 3, SYS_FSTAT = 5,
-    SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_PREAD = 17, SYS_GETPID = 39,
+    SYS_LSEEK = 8, SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_PREAD = 17, SYS_GETPID = 39,
     SYS_FLOCK = 73, SYS_FTRUNCATE = 77, SYS_RENAME = 82, SYS_UNLINK = 87,
     SYS_EXIT_GROUP = 231,
 };
@@ -184,6 +184,15 @@ void append_more(Buf *buf, Str str) {
     }
     copy(room(buf, str.n), str.p, str.n);
     buf->n += str.n;
+}
+
+void restart_answer(void) {
+    if (stream.written) {
+        if (sys3(SYS_LSEEK, stream.fd, 0, 0) != 0) fail();
+        if (stream.old_length < stream.written) stream.old_length = stream.written;
+        stream.written = 0;
+    }
+    answer.n = 0;
 }
 
 size answer_position(const Buf *out) { return stream.written + out->n; }

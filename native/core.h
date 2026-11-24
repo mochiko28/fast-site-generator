@@ -51,6 +51,7 @@ Buf *start_markdown_text(void);
 Str retain_link_key(Str text);
 Str retain_html(size mark, Str text);
 size answer_position(const Buf *out);
+void restart_answer(void);
 Str cache_answer(const Buf *out, size start);
 Str answer_fragment(const Buf *out, size start, size length);
 Str take(const Buf *buf);
@@ -104,8 +105,13 @@ void json_ascii(Buf *out, int c);
 Str slugify(Str s);
 Str unique_slug(Map *used, Str slug);
 
-enum ValueKind { NIL, STRING, NUMBER, BOOLEAN, ARRAY, RECORD, RENDERED, LITERAL_STRING };
+enum ValueKind { NIL, STRING, NUMBER, BOOLEAN, ARRAY, RECORD, RENDERED, LITERAL_STRING, PREPARED_STRING };
 typedef struct Value Value;
+typedef struct {
+    const char *plain;
+    uint length;
+    char escaped[];
+} PreparedText;
 enum Property { PROP_UNKNOWN,
     PROP_BASE_URL, PROP_CONTENT, PROP_COUNT, PROP_DATE, PROP_DATE_LONG, PROP_EXCERPT,
     PROP_FIRST, PROP_HTML, PROP_ID, PROP_INDEX, PROP_IS_POST, PROP_LAST,
@@ -124,6 +130,7 @@ enum RecordLayout {
 struct Value {
     union {
         const char *bytes;
+        const PreparedText *prepared;
         size number;
         const Value **items;
         const Value *const *fields;
@@ -138,9 +145,12 @@ struct Value {
 
 _Static_assert(sizeof(Value) == 16, "compact template values");
 
-static inline Str value_text(const Value *v) { return (Str){v->bytes, v->n}; }
+static inline Str value_text(const Value *v) {
+    return (Str){v->kind == PREPARED_STRING ? v->prepared->plain : v->bytes, v->n};
+}
 static inline Value string(Str s) { return (Value){.kind = STRING, .bytes = s.p, .n = s.n}; }
 Value template_text(Str s);
+Value prepare_text(Str s);
 static inline Value literal_string(Str s) { return (Value){.kind = LITERAL_STRING, .bytes = s.p, .n = s.n}; }
 static inline Value numeric(size n) { return (Value){.kind = NUMBER, .number = n}; }
 static inline Value boolean(int n) { return (Value){.kind = BOOLEAN, .number = n}; }

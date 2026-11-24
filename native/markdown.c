@@ -26,13 +26,25 @@ static const Entity escapes[128] = {
 };
 #undef ENTITY
 
-static inline uint marks(Vec bytes, Vec surrogate) {
+typedef struct {
+    Vec control, quote_mask, quotes, angle_mask, angles, bracket, star, backtick, surrogate;
+} InlineClasses;
+#define INLINE_CLASSES(surrogate) { \
+    SPLAT((char)0xe0), SPLAT((char)0xfa), SPLAT('"'), SPLAT((char)0x9d), SPLAT(0x1c), \
+    SPLAT('['), SPLAT('*'), SPLAT(0x60), SPLAT(surrogate) \
+}
+static const InlineClasses inline_classes[2] __attribute__((aligned(16))) = {
+    INLINE_CLASSES((char)0xed), INLINE_CLASSES(0),
+};
+#undef INLINE_CLASSES
+
+static inline uint marks(Vec bytes, const InlineClasses *c) {
     // Grouped byte tests also flag a few ASCII literals. The caller copies them unchanged.
-    Vec hits = ((bytes ^ SPLAT(-128)) < SPLAT(-96)) |
-        ((bytes & SPLAT((char)0xfa)) == SPLAT('"')) |
-        ((bytes & SPLAT((char)0x9d)) == SPLAT(0x1c)) |
-        (bytes == SPLAT('[')) | (bytes == SPLAT('*')) |
-        (bytes == SPLAT('\x60')) | (bytes == surrogate);
+    Vec hits = ((bytes & c->control) == SPLAT(0)) |
+        ((bytes & c->quote_mask) == c->quotes) |
+        ((bytes & c->angle_mask) == c->angles) |
+        (bytes == c->bracket) | (bytes == c->star) |
+        (bytes == c->backtick) | (bytes == c->surrogate);
     return __builtin_ia32_pmovmskb128(hits);
 }
 
@@ -97,15 +109,13 @@ static size link_end(Str s, size i) {
     for (; i < s.n; i += 16) {
         Vec w = *(const Vec *)(s.p + i);
         Vec ws = (w == SPLAT(' ')) | ((w > SPLAT(8)) & (w < SPLAT(14)));
-        uint closing = __builtin_ia32_pmovmskb128(w == SPLAT(')'));
-        uint gaps = __builtin_ia32_pmovmskb128(ws);
-        uint high = __builtin_ia32_pmovmskb128(w);
-        uint marks = closing | gaps | high;
-        for (; marks; marks &= marks - 1) {
-            uint j = first_bit(marks);
-            if (i + j >= s.n) return NPOS;
-            if ((closing >> j) & 1) return i + j;
-            if (((gaps >> j) & 1) || space_width(s, i + j)) return NPOS;
+        uint stops = __builtin_ia32_pmovmskb128(ws | w | (w == SPLAT(')')));
+        for (; stops; stops &= stops - 1) {
+            size end = i + first_bit(stops);
+            if (end >= s.n) return NPOS;
+            byte c = s.p[end];
+            if (c == ')') return end;
+            if (c < 128 || space_width(s, end)) return NPOS;
         }
     }
     return NPOS;
@@ -114,7 +124,7 @@ static size link_end(Str s, size i) {
 static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uint depth) {
     if (!s.n) return;
     if (depth > 128) fail();
-    Vec surrogate = SPLAT(latin1 ? 0 : (char)0xed);
+    const InlineClasses *classes = &inline_classes[latin1];
     int labels = 1;
     size i = 0;
     char *dst = room(out, s.n * 6 + 16);
@@ -123,7 +133,7 @@ static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uin
         // any speculatively copied bytes beyond the current plain text.
         Vec bytes = *(const Vec *)(s.p + i);
         *(Vec *)dst = bytes;
-        uint hits = marks(bytes, surrogate);
+        uint hits = marks(bytes, classes);
         size plain = hits ? first_bit(hits) : 16;
         if (plain >= s.n - i) {
             dst += s.n - i;
@@ -134,14 +144,25 @@ static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uin
         if (!hits) continue;
 
         unsigned c = (byte)s.p[i];
-        size next = i + 1;
-        if (c < 64 && c != '*') {
+        while (c < 64 && c != '*') {
             const Entity *entity = &escapes[c];
             __builtin_memcpy(dst, entity, sizeof(*entity));
             dst += entity->length;
             i++;
-            continue;
+            // The remaining hits in this vector still describe the original source.
+            size base = i - plain - 1;
+            hits &= hits - 1;
+            size end = hits ? base + first_bit(hits) : base + 16;
+            if (end > s.n) end = s.n;
+            *(Vec *)dst = *(const Vec *)(s.p + i);
+            dst += end - i;
+            i = end;
+            if (!hits || i == s.n) break;
+            plain = i - base;
+            c = (byte)s.p[i];
         }
+        if (!hits || i == s.n) continue;
+        size next = i + 1;
         switch (c) {
             case '\\':
                 c = at(s, next);
@@ -270,10 +291,9 @@ static const byte block_lead[256] = {
     [0x60] = FENCE_LEAD, ['-'] = RULE_LEAD, ['*'] = RULE_LEAD,
 };
 
-static int block(Str line) {
-    if (!line.n) return BLANK;
+static __attribute__((noinline)) int special_block(Str line, byte lead) {
     int c = (byte)line.p[0];
-    switch (block_lead[c]) {
+    switch (lead) {
         case INDENT_LEAD:
             if (only_indent(tail(line, 1))) return BLANK;
             break;
@@ -298,14 +318,23 @@ static int block(Str line) {
     return PARAGRAPH;
 }
 
-static size list_marker(Str line) {
-    int c = at(line, 0);
+static inline int block(Str line) {
+    if (!line.n) return BLANK;
+    byte lead = block_lead[(byte)line.p[0]];
+    return lead == TEXT_LEAD ? PARAGRAPH : special_block(line, lead);
+}
+
+static __attribute__((noinline)) size special_list_marker(Str line, int c) {
     if (c == '-' || c == '*') return at(line, 1) == ' ' && !has_line_separator(line) ? 2 : 0;
-    if (!digit(c)) return 0;
     size i = 1;
     while (i < 10 && digit(at(line, i))) i++;
     return i < 10 && at(line, i) == '.' && at(line, i + 1) == ' ' &&
         !has_line_separator(line) ? i + 2 : 0;
+}
+
+static inline size list_marker(Str line) {
+    int c = at(line, 0);
+    return c == '-' || c == '*' || digit(c) ? special_list_marker(line, c) : 0;
 }
 
 static int continued(Str line) {
@@ -346,6 +375,17 @@ static inline uint queue_lines(uint *ends, uint count, size base, uint breaks) {
     return count;
 }
 
+static inline __attribute__((target("avx2"))) uint unicode_space_leads(Wide w) {
+    // C2 shares its low nibble with E2 and gets a separate byte comparison.
+    const Wide leads = {0, (char)0xe1, (char)0xe2, (char)0xe3, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, (char)0xef,
+                        0, (char)0xe1, (char)0xe2, (char)0xe3, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, (char)0xef};
+    Wide match = (w == __builtin_ia32_pshufb256(leads, w & SPLAT_WIDE(15))) |
+                 (w == SPLAT_WIDE((char)0xc2));
+    return __builtin_ia32_pmovmskb256(match & w);
+}
+
 static __attribute__((target("avx2,popcnt"), noinline)) void scan_wide(Lines *lines) {
     Str body = lines->body;
     size i = lines->next;
@@ -359,16 +399,10 @@ static __attribute__((target("avx2,popcnt"), noinline)) void scan_wide(Lines *li
             Wide ws = (w == SPLAT_WIDE(' ')) | ((w > SPLAT_WIDE(8)) & (w < SPLAT_WIDE(14)));
             // Keep enough high bits for whitespace that crosses into the next vector.
             size mask = (gaps >> 1) | (uint)__builtin_ia32_pmovmskb256(ws);
-            if (__builtin_ia32_pmovmskb256(w)) {
-                uint leads = __builtin_ia32_pmovmskb256(
-                    (w == SPLAT_WIDE((char)0xc2)) | (w == SPLAT_WIDE((char)0xe1)) |
-                    (w == SPLAT_WIDE((char)0xe2)) | (w == SPLAT_WIDE((char)0xe3)) |
-                    (w == SPLAT_WIDE((char)0xef)));
-                for (; leads; leads &= leads - 1) {
-                    uint j = first_bit(leads);
-                    size width = space_width(body, i + j);
-                    mask |= ((1UL << width) - 1) << j;
-                }
+            for (uint leads = unicode_space_leads(w); leads; leads &= leads - 1) {
+                uint j = first_bit(leads);
+                size width = space_width(body, i + j);
+                mask |= ((1UL << width) - 1) << j;
             }
             words += __builtin_popcount((uint)(~mask & ((mask << 1) | (gaps & 1))));
             // Keep the preceding gap and any carried lanes together.
@@ -554,7 +588,7 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
             ADD(&html, "<hr>\\n");
             advance(&lines);
         } else if (kind == BLANK) {
-            advance(&lines);
+            do advance(&lines); while (lines.at <= body.n && !lines.line.n);
         } else if (kind != PARAGRAPH) {
             Str text = trim_line(tail(lines.line, kind));
             PHASE_BEGIN(markdown_phase, SLUGS);
