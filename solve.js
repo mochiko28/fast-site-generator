@@ -63,10 +63,12 @@ function compareBytes(a, b) {
   return compare(a, b);
 }
 
-function trimLine(line, start, end) {
+function trimLine(line) {
+  let start = 0;
+  let end = line.length;
   while (line.charCodeAt(start) === 32 || line.charCodeAt(start) === 9) start++;
   while (end > start && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end--;
-  return line.slice(start, end);
+  return start === 0 && end === line.length ? line : line.slice(start, end);
 }
 
 function onlyIndent(line, start = 0, end = line.length) {
@@ -112,10 +114,6 @@ const EXPLICIT_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const FRONT_PADDING = /[ \t]+$/;
 const BAD_DATE = 'not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)';
 
-function twoDigits(text, at) {
-  return (text.charCodeAt(at) - 48) * 10 + (text.charCodeAt(at + 1) - 48);
-}
-
 function frontValue(key, raw, latin1) {
   switch (key) {
     case 'title':
@@ -123,9 +121,9 @@ function frontValue(key, raw, latin1) {
       return quotedValue(raw);
     case 'date': {
       if (!DATE_FIELD.test(raw)) throw BAD_DATE;
-      const year = 100 * twoDigits(raw, 0) + twoDigits(raw, 2);
-      const month = twoDigits(raw, 5);
-      const day = twoDigits(raw, 8);
+      const year = +raw.slice(0, 4);
+      const month = +raw.slice(5, 7);
+      const day = +raw.slice(8, 10);
       const limit = month === 2 ? (year % 4 === 0 ? 29 : 28)
         : (month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31);
       // Within 1970–2099 the century year, 2000, is a leap year.
@@ -244,8 +242,8 @@ const RENDERED_JSON = Symbol();
 const RENDERED_TEXT = Symbol();
 
 class RenderedString {
-  constructor(text, encoded = false) {
-    this[RENDERED_JSON] = encoded ? text : jsonText(text);
+  constructor(text) {
+    this[RENDERED_JSON] = jsonText(text);
     this[RENDERED_TEXT] = undefined;
   }
 
@@ -254,11 +252,15 @@ class RenderedString {
   }
 }
 
-const HTML_SPECIAL = /[&<>"']/g;
-const htmlEntity = (character) => HTML_ENTITIES[character];
+const AMPERSAND = /&/g;
+const LESS_THAN = /</g;
+const GREATER_THAN = />/g;
+const DOUBLE_QUOTE = /"/g;
+const APOSTROPHE = /'/g;
 
 function escapeHtml(text) {
-  return text.replace(HTML_SPECIAL, htmlEntity);
+  return text.replace(AMPERSAND, '&amp;').replace(LESS_THAN, '&lt;').replace(GREATER_THAN, '&gt;')
+    .replace(DOUBLE_QUOTE, '&quot;').replace(APOSTROPHE, '&#39;');
 }
 
 const HTML_ENTITY = /&(?:amp|lt|gt|quot|#39);/g;
@@ -372,7 +374,7 @@ function blockStart(body, at, end, separator) {
     const level = text - at;
     const next = body.charCodeAt(text);
     if (level <= 6 && (next === 32 || next === 9) && !onlyIndent(body, text + 1, end)
-      && (separator === null || !separator.test(body.slice(text, end)))) return level;
+      && !separator.test(body.slice(text, end))) return level;
   } else if (first === 96 && body.startsWith('```', at)) {
     let i = at + 3;
     for (; i < end; i++) {
@@ -391,34 +393,31 @@ function blockStart(body, at, end, separator) {
   return 0;
 }
 
-function listMarker(body, at, end, separator) {
-  const first = body.charCodeAt(at);
+function listMarker(line, separator) {
+  const first = line.charCodeAt(0);
   if (first === 42 || first === 45) {
-    return body.charCodeAt(at + 1) === 32
-      && (separator === null || !separator.test(body.slice(at, end))) ? 2 : 0;
+    return line.charCodeAt(1) === 32 && !separator.test(line) ? 2 : 0;
   }
-  if (first < 48 || first > 57 || at === end) return 0;
+  if (first < 48 || first > 57 || line.length === 0) return 0;
   let digits = 1;
   for (; digits < 10; digits++) {
-    const next = body.charCodeAt(at + digits);
+    const next = line.charCodeAt(digits);
     if (!(next >= 48 && next <= 57)) break;
   }
-  return digits < 10 && body.charCodeAt(at + digits) === 46 && body.charCodeAt(at + digits + 1) === 32
-    && (separator === null || !separator.test(body.slice(at, end))) ? digits + 2 : 0;
+  return digits < 10 && line.charCodeAt(digits) === 46 && line.charCodeAt(digits + 1) === 32
+    && !separator.test(line) ? digits + 2 : 0;
 }
 
-const BYTE_SPACE_AT = new RegExp(BYTE_SPACE.source, 'y');
-
-function continuesList(body, at, end, latin1) {
-  if (body.charCodeAt(at) !== 32 || body.charCodeAt(at + 1) !== 32) return false;
-  let i = at + 2;
-  while (body.charCodeAt(i) === 32) i++;
-  if (i === end) return false;
-  const next = body.charCodeAt(i);
+function continuesList(line, latin1) {
+  if (line.charCodeAt(0) !== 32 || line.charCodeAt(1) !== 32) return false;
+  let i = 2;
+  while (line.charCodeAt(i) === 32) i++;
+  if (i === line.length) return false;
+  const next = line.charCodeAt(i);
   if (next < 128) return next < 9 || next > 13;
-  if (!latin1) return !UNICODE_SPACE.test(body[i]);
-  BYTE_SPACE_AT.lastIndex = i;
-  return !BYTE_SPACE_AT.test(body);
+  if (!latin1) return !UNICODE_SPACE.test(line[i]);
+  const space = BYTE_SPACE.exec(line.slice(i));
+  return space === null || space.index !== 0;
 }
 
 function lineEnd(body, at) {
@@ -428,8 +427,7 @@ function lineEnd(body, at) {
 
 function renderMarkdown(source, link, latin1) {
   const body = escapeHtml(source);
-  const lineSeparator = latin1 ? MARKDOWN_BYTE_SEPARATOR : MARKDOWN_SEPARATOR;
-  const separator = lineSeparator.test(body) ? lineSeparator : null;
+  const separator = latin1 ? MARKDOWN_BYTE_SEPARATOR : MARKDOWN_SEPARATOR;
   const ids = new Set();
   const toc = [];
   let html = '';
@@ -440,7 +438,7 @@ function renderMarkdown(source, link, latin1) {
 
   while (at <= body.length) {
     if (kind === FENCE) {
-      const language = trimLine(body, at + 3, end);
+      const language = trimLine(body.slice(at + 3, end));
       const open = language ? '<pre><code class="language-' + language + '">' : '<pre><code>';
       const start = end + 1;
       let fence = body.indexOf('\n```', end);
@@ -458,7 +456,7 @@ function renderMarkdown(source, link, latin1) {
       html += '<hr>\n';
       at = end + 1;
     } else if (kind > 0 && kind < FENCE) {
-      const heading = trimLine(body, at + kind, end);
+      const heading = trimLine(body.slice(at + kind, end));
       const id = reserveSlug(slugify(unescapeHtml(heading), latin1), ids);
       const text = renderInline(heading, link, latin1);
       html += '<h' + kind + ' id="' + id + '">' + text + '</h' + kind + '>\n';
@@ -471,7 +469,7 @@ function renderMarkdown(source, link, latin1) {
       // An actual '>' becomes '&gt;' while a literal '&gt;' becomes '&amp;gt;'.
       let content = '';
       do {
-        const next = trimLine(body, at + 4, end);
+        const next = trimLine(body.slice(at + 4, end));
         if (next) content = content ? content + '\n' + next : next;
         at = end + 1;
         end = lineEnd(body, at);
@@ -484,22 +482,23 @@ function renderMarkdown(source, link, latin1) {
     } else {
       const first = body.charCodeAt(at);
       const marker = first === 42 || first === 45 || (first >= 48 && first <= 57)
-        ? listMarker(body, at, end, separator) : 0;
+        ? listMarker(body.slice(at, end), separator) : 0;
       if (marker) {
         const ordered = marker !== 2;
         const tag = ordered ? 'ol' : 'ul';
         const start = ordered ? Number(body.slice(at, at + marker - 2)) : 1;
         html += start !== 1 ? '<ol start="' + start + '">\n' : '<' + tag + '>\n';
-        let item = trimLine(body, at + marker, end);
+        let item = trimLine(body.slice(at + marker, end));
         at = end + 1;
         while (at <= body.length) {
           end = lineEnd(body, at);
-          const prefix = listMarker(body, at, end, separator);
+          const next = body.slice(at, end);
+          const prefix = listMarker(next, separator);
           if ((ordered && prefix > 2) || (!ordered && prefix === 2)) {
             html += '<li>' + renderInline(item, link, latin1) + '</li>\n';
-            item = trimLine(body, at + prefix, end);
-          } else if (continuesList(body, at, end, latin1)) {
-            item += '\n' + trimLine(body, at, end);
+            item = trimLine(next.slice(prefix));
+          } else if (continuesList(next, latin1)) {
+            item += '\n' + trimLine(next);
           } else {
             break;
           }
@@ -517,7 +516,7 @@ function renderMarkdown(source, link, latin1) {
         const head = body.charCodeAt(at);
         const tail = body.charCodeAt(end - 1);
         if (head === 32 || head === 9 || tail === 32 || tail === 9) {
-          paragraph += body.slice(from, at) + trimLine(body, at, end);
+          paragraph += body.slice(from, at) + trimLine(body.slice(at, end));
           from = end;
         }
         last = end;
@@ -534,28 +533,7 @@ function renderMarkdown(source, link, latin1) {
     end = lineEnd(body, at);
     kind = blockStart(body, at, end, separator);
   }
-  return { content: html, toc, excerpt: new RenderedString(excerpt ?? '') };
-}
-
-// Serialize the rendered bodies together so V8 can flatten their HTML in
-// one pass. If a body contains the separator, encode each body on its own.
-function encodeContents(sources) {
-  let length = sources.length - 1;
-  const bodies = sources.map((source) => {
-    const content = source.markdown.content;
-    length += content.length;
-    return content;
-  });
-  let fragments;
-  // Limit the size of the temporary string even when every code unit escapes.
-  if (bodies.length > 1 && length <= 32 * 1024 * 1024) {
-    const separator = '\x7f';
-    const batch = jsonText(bodies.join(separator)).split(separator);
-    if (batch.length === bodies.length) fragments = batch;
-  }
-  for (let i = 0; i < sources.length; i++) {
-    sources[i].markdown.content = new RenderedString(fragments?.[i] ?? bodies[i], fragments !== undefined);
-  }
+  return { content: new RenderedString(html), toc, excerpt: new RenderedString(excerpt ?? '') };
 }
 
 const TEMPLATE_PATH = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
@@ -899,87 +877,46 @@ function sourceDir(path) {
 
 const HTML_PUNCTUATION = /[&<>"']/;
 const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
-const EMPTY_DIRECTORY_SEGMENT = /^\/|\/\/|\/$/;
-const PATH_NEEDS_NORMALIZATION = /(?:^|\/)\.{1,2}(?=\/|$)|\/\/|\/$/;
 
-function normalizedPath(dir, target, end) {
-  if (end === 0) return null;
-  const relative = end === target.length ? target : target.slice(0, end);
-  if (!PATH_NEEDS_NORMALIZATION.test(relative)) return dir ? dir + '/' + relative : relative;
-  if (!EMPTY_DIRECTORY_SEGMENT.test(dir)) {
-    let path = dir;
-    for (let at = 0; at < end;) {
-      const slash = target.indexOf('/', at);
-      const stop = slash < 0 || slash > end ? end : slash;
-      const size = stop - at;
-      if (size === 2 && target.startsWith('..', at)) {
-        if (path === '') return null;
-        const parent = path.lastIndexOf('/');
-        path = parent < 0 ? '' : path.slice(0, parent);
-      } else if (size !== 0 && !(size === 1 && target.charCodeAt(at) === 46)) {
-        const segment = target.slice(at, stop);
-        path = path === '' ? segment : path + '/' + segment;
-      }
-      at = stop + 1;
-    }
-    return path;
-  }
-  const parts = dir === '' ? [] : dir.split('/');
-  for (const part of relative.split('/')) {
-    if (part === '' || part === '.') continue;
-    if (part === '..') {
-      if (parts.length === 0) return null;
-      parts.pop();
-    } else {
-      parts.push(part);
-    }
-  }
-  return parts.join('/');
-}
-
-function linkResolver(sources, statics, broken, base) {
-  const directories = new Map();
-  let sourcePath;
-  let dir;
+function linkResolver(source, sources, statics, broken, base) {
+  const dir = sourceDir(source.path);
+  let directory;
   let targets;
-  let sourceWarnings;
-
-  function from(path) {
-    sourcePath = path;
-    dir = sourceDir(path);
-    targets = directories.get(dir);
-    sourceWarnings = undefined;
-  }
-
-  function link(escapedTarget) {
+  return (escapedTarget) => {
     const first = escapedTarget[0];
     if (first === '#' || first === '/' || URI_SCHEME.test(escapedTarget)) return escapedTarget;
-    if (targets === undefined) directories.set(dir, targets = new Map());
-    let resolved = targets.get(escapedTarget);
-    if (resolved === undefined) {
-      const target = unescapeHtml(escapedTarget);
-      const hash = target.indexOf('#');
-      const path = normalizedPath(dir, target, hash < 0 ? target.length : hash);
-      const page = sources.get(path);
-      if (page !== undefined || statics.has(path)) {
-        const fragment = hash < 0 ? '' : target.slice(hash);
-        const href = (page !== undefined ? page.url : base + '/' + path) + fragment;
-        resolved = HTML_PUNCTUATION.test(href) ? escapeHtml(href) : href;
+    targets ??= new Map();
+    const cached = targets.get(escapedTarget);
+    if (cached !== undefined) return cached;
+    const target = unescapeHtml(escapedTarget);
+    let href = target;
+    const hash = target.indexOf('#');
+    const relative = hash < 0 ? target : target.slice(0, hash);
+    directory ??= dir === '' ? [] : dir.split('/');
+    const parts = directory.slice();
+    let valid = relative !== '';
+    for (const part of relative.split('/')) {
+      if (part === '' || part === '.') continue;
+      if (part === '..') {
+        if (parts.length === 0) {
+          valid = false;
+          break;
+        }
+        parts.pop();
       } else {
-        resolved = null;
+        parts.push(part);
       }
-      targets.set(escapedTarget, resolved);
     }
-    if (resolved !== null) return resolved;
-    sourceWarnings ??= new Set();
-    if (!sourceWarnings.has(escapedTarget)) {
-      sourceWarnings.add(escapedTarget);
-      broken.add('broken-link ' + sourcePath + ' -> ' + unescapeHtml(escapedTarget));
-    }
-    return escapedTarget;
-  }
-
-  return { from, link };
+    const path = valid ? parts.join('/') : null;
+    const page = sources.get(path);
+    const fragment = hash < 0 ? '' : target.slice(hash);
+    if (page !== undefined) href = page.url + fragment;
+    else if (statics.has(path)) href = base + '/' + path + fragment;
+    else broken.add('broken-link ' + source.path + ' -> ' + target);
+    const escaped = href === target ? escapedTarget : HTML_PUNCTUATION.test(href) ? escapeHtml(href) : href;
+    targets.set(escapedTarget, escaped);
+    return escaped;
+  };
 }
 
 function hasUnicodeByteSpace(body) {
@@ -999,22 +936,16 @@ function hasUnicodeByteSpace(body) {
 const ASCII_WORD_GROUP = /[^\t-\r ]+(?:[\t-\r ]+[^\t-\r ]+){0,199}/g;
 const WORD_GROUP = /\S+(?:\s+\S+){0,199}/g;
 
-function countWordGroups(body, pattern) {
-  let count = 0;
-  while (pattern.test(body)) count++;
-  return Math.max(1, count);
-}
-
 function readingMinutes(body, latin1) {
   // A 201st word needs at least 401 code units including its separators.
   if (body.length <= 400) return 1;
   // The number of matches is ceil(words / 200). In byte mode every
   // Unicode whitespace character has one of the sequences in BYTE_SPACE.
   if (latin1 && !hasUnicodeByteSpace(body)) {
-    return countWordGroups(body, ASCII_WORD_GROUP);
+    return Math.max(1, body.match(ASCII_WORD_GROUP)?.length ?? 0);
   }
   if (latin1) body = decode(body);
-  return countWordGroups(body, WORD_GROUP);
+  return Math.max(1, body.match(WORD_GROUP)?.length ?? 0);
 }
 
 function linkRecord(source) {
@@ -1025,7 +956,7 @@ function linkRecord(source) {
 
 function makeCard(source, tagRefs, latin1) {
   const { title, date = '', summary = '' } = source.data;
-  const dateLong = date ? twoDigits(date, 8) + ' ' + MONTHS[twoDigits(date, 5) - 1]
+  const dateLong = date ? Number(date.slice(8, 10)) + ' ' + MONTHS[Number(date.slice(5, 7)) - 1]
     + ' ' + date.slice(0, 4) : '';
   return {
     title,
@@ -1127,13 +1058,11 @@ function run(input, opts) {
 
   const staticPaths = new Set(statics.map((file) => file.path));
   const broken = new Set();
-  const { from, link } = linkResolver(byPath, staticPaths, broken, base);
   for (const source of sources) {
-    from(source.path);
+    const link = linkResolver(source, byPath, staticPaths, broken, base);
     source.markdown = renderMarkdown(source.body, link, latin1);
   }
 
-  encodeContents(sources);
   const posts = sources.filter((source) => source.post);
   posts.sort((a, b) => compare(b.data.date, a.data.date) || compare(a.slug, b.slug));
   const tags = collectTags(posts, sources, base, latin1);

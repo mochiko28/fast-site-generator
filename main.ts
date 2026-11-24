@@ -1,3 +1,4 @@
+require('./site.node');
 require('node:v8').setFlagsFromString('--no-incremental-marking --no-turbofan --always-sparkplug --single-threaded-gc --semi-space-growth-factor=16');
 const { readFileSync, writeFileSync, openSync, closeSync, writeSync } = require('node:fs');
 const { run } = require('./solve.js');

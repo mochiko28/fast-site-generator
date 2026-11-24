@@ -1,0 +1,353 @@
+#include "core.h"
+
+uint decode(Str s, size *i) {
+    uint cp = (byte)s.p[(*i)++];
+    if (cp < 0x80) return cp;
+    uint length, minimum;
+    if (cp < 0xc2 || cp > 0xf4) fail();
+    if (cp < 0xe0) {
+        cp &= 31;
+        length = 1;
+        minimum = 0x80;
+    } else if (cp < 0xf0) {
+        cp &= 15;
+        length = 2;
+        minimum = 0x800;
+    } else {
+        cp &= 7;
+        length = 3;
+        minimum = 0x10000;
+    }
+    if (s.n - *i < length) fail();
+    while (length--) {
+        uint byte = (unsigned char)s.p[(*i)++];
+        if ((byte & 0xc0) != 0x80) fail();
+        cp = (cp << 6) | (byte & 63);
+    }
+    if (cp < minimum || cp > 0x10ffff) fail();
+    return cp;
+}
+
+void validate_utf8(Str s) {
+    for (size i = 0; i < s.n;) {
+        if ((byte)s.p[i] < 0x80) {
+            i++;
+        } else {
+            uint cp = decode(s, &i);
+            if (cp >= 0xd800 && cp <= 0xdfff) fail();
+        }
+    }
+}
+
+void encode(Buf *out, uint cp) {
+    char *p = room(out, 4);
+    if (cp < 0x80) {
+        *p++ = (char)cp;
+    } else {
+        if (cp < 0x800) {
+            *p++ = (char)(0xc0 | (cp >> 6));
+        } else {
+            if (cp < 0x10000) {
+                *p++ = (char)(0xe0 | (cp >> 12));
+            } else {
+                *p++ = (char)(0xf0 | (cp >> 18));
+                *p++ = (char)(0x80 | ((cp >> 12) & 63));
+            }
+            *p++ = (char)(0x80 | ((cp >> 6) & 63));
+        }
+        *p++ = (char)(0x80 | (cp & 63));
+    }
+    out->n = p - out->p;
+}
+
+static uint code_unit(Str s, size *i, uint *pending) {
+    if (*pending) {
+        uint low = *pending;
+        *pending = 0;
+        return low;
+    }
+    if (*i == s.n) return 0x10000;
+    uint cp = decode(s, i);
+    if (cp <= 0xffff) return cp;
+    cp -= 0x10000;
+    *pending = 0xdc00 + (cp & 1023);
+    return 0xd800 + (cp >> 10);
+}
+
+int compare(Str a, Str b) {
+    size n = a.n < b.n ? a.n : b.n;
+    for (size i = 0; i < n; i++) {
+        int x = (byte)a.p[i], y = (byte)b.p[i];
+        if (x == y) continue;
+        if (x < 128 || y < 128) return x - y;
+        // UTF-8 and UTF-16 differ at supplementary/BMP boundaries.
+        while (i && ((byte)a.p[i] & 0xc0) == 0x80 && ((byte)b.p[i] & 0xc0) == 0x80) i--;
+        size j = i;
+        uint low_a = 0, low_b = 0;
+        for (;;) {
+            uint ca = code_unit(a, &i, &low_a), cb = code_unit(b, &j, &low_b);
+            if (ca == cb && ca != 0x10000) continue;
+            if (ca == cb) return 0;
+            if (ca == 0x10000 || cb == 0x10000) return cb == 0x10000 ? 1 : -1;
+            return (int)ca - (int)cb;
+        }
+    }
+    return (a.n > b.n) - (a.n < b.n);
+}
+
+size space_width(Str s, size i) {
+    int c = at(s, i);
+    if (c == ' ' || (c >= '\t' && c <= '\r')) return 1;
+    int b = at(s, i + 1), d = at(s, i + 2);
+    switch (c) {
+        case 0xc2: return b == 0xa0 ? 2 : 0;
+        case 0xe1: return b == 0x9a && d == 0x80 ? 3 : 0;
+        case 0xe2:
+            if (b == 0x80) return (d >= 0x80 && d <= 0x8a) || d == 0xa8 || d == 0xa9 || d == 0xaf ? 3 : 0;
+            return b == 0x81 && d == 0x9f ? 3 : 0;
+        case 0xe3: return b == 0x80 && d == 0x80 ? 3 : 0;
+        case 0xef: return b == 0xbb && d == 0xbf ? 3 : 0;
+        default: return 0;
+    }
+}
+
+int has_space(Str s) {
+    for (size i = 0; i < s.n; i++) {
+        int c = (byte)s.p[i];
+        if (c <= ' ' || c >= 0xc2)
+            if (space_width(s, i)) return 1;
+    }
+    return 0;
+}
+
+int has_line_separator(Str s) {
+    for (size i = 0; i + 2 < s.n; i++)
+        if ((byte)s.p[i] == 0xe2 && (byte)s.p[i + 1] == 0x80 &&
+            ((byte)s.p[i + 2] == 0xa8 || (byte)s.p[i + 2] == 0xa9)) return 1;
+    return 0;
+}
+
+Str trim(Str s) {
+    size a = 0, b = s.n, width;
+    while ((width = space_width(s, a))) a += width;
+    while (b > a) {
+        size i = b - 1;
+        while (i > a && ((byte)s.p[i] & 0xc0) == 0x80) i--;
+        if (space_width(s, i) != b - i) break;
+        b = i;
+    }
+    return slice(s, a, b);
+}
+
+int only_indent(Str s) {
+    for (size i = 0; i < s.n; i++) if (!indent(s.p[i])) return 0;
+    return 1;
+}
+
+Str trim_line(Str s) {
+    size a = 0, b = s.n;
+    while (a < b && indent(s.p[a])) a++;
+    while (b > a && indent(s.p[b - 1])) b--;
+    return slice(s, a, b);
+}
+
+static const Str entities[128] = {
+    ['&'] = S("&amp;"), ['<'] = S("&lt;"), ['>'] = S("&gt;"),
+    ['"'] = S("&quot;"), ['\''] = S("&#39;"),
+};
+static const char hex[] = "0123456789abcdef";
+
+void json_code_unit(Buf *out, uint cp) {
+    char *p = room(out, 6);
+    p[0] = '\\';
+    p[1] = 'u';
+    p[2] = hex[(cp >> 12) & 15];
+    p[3] = hex[(cp >> 8) & 15];
+    p[4] = hex[(cp >> 4) & 15];
+    p[5] = hex[cp & 15];
+    out->n += 6;
+}
+
+typedef char Vec __attribute__((vector_size(16), aligned(1), may_alias));
+#define SPLAT(c) ((Vec){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c})
+
+static size next_json(Str s, size i, int html, int unicode) {
+    // UTF-8 bytes are all >= 0x80. Bias signed lanes for the unsigned control check.
+    for (; s.n - i >= 16; i += 16) {
+        Vec w = *(const Vec *)(s.p + i);
+        Vec hit = ((w ^ SPLAT(-128)) < SPLAT(-96)) | (w == SPLAT('"')) | (w == SPLAT('\\'));
+        if (html) hit |= (w == SPLAT('&')) | (w == SPLAT('<')) | (w == SPLAT('>')) | (w == SPLAT('\''));
+        if (unicode == 1) hit |= w == SPLAT((char)0xed);
+        if (unicode == 2) hit |= w;
+        uint mask = __builtin_ia32_pmovmskb128(hit);
+        if (mask) return i + __builtin_ctz(mask);
+    }
+    for (; i < s.n; i++) {
+        uint c = (byte)s.p[i];
+        if (c < 32 || c == '\\' || c == '"' || (unicode == 1 && c == 0xed) || (unicode == 2 && c >= 128) ||
+            (html && c < COUNT(entities) && entities[c].n)) break;
+    }
+    return i;
+}
+
+static Str json_escape(int c) {
+    switch (c) {
+        case '\\': return S("\\\\");
+        case '"': return S("\\\"");
+        case '\b': return S("\\b");
+        case '\t': return S("\\t");
+        case '\n': return S("\\n");
+        case '\f': return S("\\f");
+        case '\r': return S("\\r");
+        default: return (Str){0};
+    }
+}
+
+void json_ascii(Buf *out, int c) {
+    Str special = json_escape(c);
+    if (special.n) append(out, special);
+    else if (c < 32) json_code_unit(out, c);
+    else put(out, c);
+}
+
+void json(Buf *out, Str s, int html, int escape_pairs) {
+    int unicode = latin1 ? 0 : 1 + !!escape_pairs;
+    size from = 0;
+    for (size i = 0; (i = next_json(s, i, html, unicode)) < s.n;) {
+        uint c = (byte)s.p[i];
+        size next = i + 1;
+        Str entity = {0};
+        if (c < 128) {
+            if (html) entity = entities[c];
+            if (!entity.n) entity = json_escape(c);
+        } else {
+            next = i;
+            c = decode(s, &next);
+            if (c < 0xd800 || (c > 0xdfff && (!escape_pairs || c < 0x10000))) {
+                i = next;
+                continue;
+            }
+        }
+        append(out, slice(s, from, i));
+        if (entity.n) append(out, entity);
+        else if (c < 0x10000) {
+            if (!escape_pairs && c >= 0xd800 && c <= 0xdbff && at(s, next) == 0xed) {
+                size end = next;
+                uint low = decode(s, &end);
+                if (low >= 0xdc00 && low <= 0xdfff) {
+                    encode(out, 0x10000 + ((c - 0xd800) << 10) + low - 0xdc00);
+                    from = i = end;
+                    continue;
+                }
+            }
+            json_code_unit(out, c);
+        } else {
+            c -= 0x10000;
+            json_code_unit(out, 0xd800 + (c >> 10));
+            json_code_unit(out, 0xdc00 + (c & 1023));
+        }
+        from = i = next;
+    }
+    append(out, tail(s, from));
+}
+
+void escape_rendered(Buf *out, Str s) {
+    size from = 0;
+    for (size i = 0; (i = next_json(s, i, 1, 0)) < s.n;) {
+        uint c = (byte)s.p[i];
+        size next = i + 1;
+        if (c == '\\') {
+            c = at(s, next++);
+            if (c != '"') {
+                i = next;
+                continue;
+            }
+        }
+        append(out, slice(s, from, i));
+        append(out, entities[c]);
+        from = i = next;
+    }
+    append(out, tail(s, from));
+}
+
+#include "unicode.inc"
+
+static Str slug_projection(uint cp) {
+    size lo = 0, hi = COUNT(slug_drops);
+    while (lo < hi) {
+        size mid = (lo + hi) / 2;
+        if (cp < slug_drops[mid].first) hi = mid;
+        else if (cp > slug_drops[mid].last) lo = mid + 1;
+        else return (Str){0};
+    }
+    lo = 0;
+    hi = COUNT(slug_maps);
+    while (lo < hi) {
+        size mid = (lo + hi) / 2;
+        if (cp < slug_maps[mid].cp) hi = mid;
+        else if (cp > slug_maps[mid].cp) lo = mid + 1;
+        else return (Str){slug_data + slug_maps[mid].offset, slug_maps[mid].length};
+    }
+    return S("-");
+}
+
+static void slug_byte(char *buf, size *n, int *gap, int c) {
+    if (!letter(c) && !digit(c)) {
+        *gap = *n != 0;
+        return;
+    }
+    if (*gap) {
+        if (*n == 63) {
+            *n = 64;
+            buf[63] = '-';
+            return;
+        }
+        buf[(*n)++] = '-';
+        *gap = 0;
+    }
+    buf[(*n)++] = letter(c) ? (c | 32) : c;
+}
+
+Str slugify(Str s) {
+    char chars[64];
+    size n = 0;
+    int gap = 0;
+    for (size i = 0; i < s.n && n < sizeof(chars);) {
+        uint c = (byte)s.p[i];
+        if (c < 128) {
+            i++;
+            slug_byte(chars, &n, &gap, c);
+        } else {
+            Str projection = slug_projection(decode(s, &i));
+            for (size j = 0; j < projection.n && n < sizeof(chars); j++)
+                slug_byte(chars, &n, &gap, projection.p[j]);
+        }
+    }
+    if (n && chars[n - 1] == '-') n--;
+    return n ? JOIN(((Str){chars, n})) : S("untitled");
+}
+
+Str unique_slug(Map *used, Str slug) {
+    Str name = slug;
+    for (size n = 2; get(used, name); n++) name = JOIN(slug, S("-"), number(n));
+    set(used, name, (void *)1);
+    return name;
+}
+
+const Value *property(const Value *value, Str name) {
+    if (!value) return 0;
+    if (value->kind == RECORD) {
+        for (size i = 0; i < value->record.n; i++) {
+            const Field *f = &value->record.items[i];
+            if (equal(name, f->name)) return f->value;
+        }
+    }
+    if (value->kind == ARRAY && equal(name, S("length"))) {
+        // Template paths cannot contain a numeric segment.
+        static Value length;
+        length = numeric(value->array.n);
+        return &length;
+    }
+    return 0;
+}
+
