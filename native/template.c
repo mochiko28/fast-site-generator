@@ -2,7 +2,7 @@
 
 enum NodeKind { TEXT, RAW, ESCAPED, TAG, FOR, IF, INCLUDE };
 
-typedef struct { Str *parts; size n; } Path;
+typedef struct { Str name; enum Property *parts; size n; } Path;
 struct Node {
     enum NodeKind kind;
     int negate;
@@ -46,11 +46,12 @@ static int parse_path(Path *path, Str text) {
         if (text.p[end] != '.') return 0;
         i = end + 1;
     }
-    *path = (Path){NEW(Str, count), count};
+    *path = (Path){.name = slice(text, 0, identifier_end(text, 0)),
+                   .parts = NEW(enum Property, count), .n = count};
     size from = 0;
     for (size i = 0; i < count; i++) {
         size end = identifier_end(text, from);
-        path->parts[i] = slice(text, from, end);
+        path->parts[i] = property_id(slice(text, from, end));
         from = end + 1;
     }
     return 1;
@@ -200,15 +201,16 @@ struct Scope {
     Str name;
     const Value *item, *loop;
     const Value *root, *globals;
+    size root_names;
 };
 
 static const Value *lookup(const Scope *scope, Path path) {
-    Str name = path.parts[0];
+    Str name = path.name;
     const Value *v;
     for (;;) {
         if (!scope->parent) {
-            v = property(scope->root, name);
-            if (!v) v = property(scope->globals, name);
+            v = property(scope->root, path.parts[0]);
+            if (!v) v = property(scope->globals, path.parts[0]);
             break;
         }
         if (equal(name, S("loop"))) {
@@ -239,13 +241,8 @@ static int truthy(const Value *v) {
 }
 
 static void write_number(Buf *out, size value) {
-    char digits[24];
-    size i = sizeof(digits);
-    do {
-        digits[--i] = '0' + value % 10;
-        value /= 10;
-    } while (value);
-    append(out, (Str){digits + i, sizeof(digits) - i});
+    char digits[20];
+    append(out, format_number(digits + sizeof(digits), value));
 }
 
 static void write_value(Buf *out, const Value *v, int raw) {
@@ -281,20 +278,28 @@ static void render_nodes(Buf *out, const Node *nodes, const Scope *scope, uint i
 // missing values, and at most one loop item. Loop metadata varies by iteration.
 struct Memo {
     Str names[8], constant;
-    size count;
+    enum Property properties[8];
+    size count, root_names;
     int has_constant, disabled;
     Map by_item;
 };
+_Static_assert(PROP_URL < 64, "template property mask");
 
 typedef struct Binding Binding;
 struct Binding { Str name; const Binding *outer; };
 
-static void add_free_name(Memo *memo, Str name, const Binding *bindings) {
+static void add_free_name(Memo *memo, Path path, const Binding *bindings) {
+    Str name = path.name;
     for (; bindings; bindings = bindings->outer)
         if (equal(name, bindings->name) || equal(name, S("loop"))) return;
     for (size i = 0; i < memo->count; i++) if (equal(name, memo->names[i])) return;
     if (memo->count == COUNT(memo->names)) memo->disabled = 1;
-    else memo->names[memo->count++] = name;
+    else {
+        enum Property property = path.parts[0];
+        memo->root_names |= 1UL << property;
+        memo->properties[memo->count] = property;
+        memo->names[memo->count++] = name;
+    }
 }
 
 static void collect_free(Memo *memo, const Node *nodes, uint depth, const Binding *bindings, size *budget) {
@@ -304,7 +309,7 @@ static void collect_free(Memo *memo, const Node *nodes, uint depth, const Bindin
             return;
         }
         --*budget;
-        if (node->path.n) add_free_name(memo, node->path.parts[0], bindings);
+        if (node->path.n) add_free_name(memo, node->path, bindings);
         if (node->kind == FOR) {
             Binding binding = {node->text, bindings};
             collect_free(memo, node->body, depth, &binding, budget);
@@ -331,7 +336,8 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
 
     const Value *item = 0;
     size binding_index = 0;
-    for (size i = 0; i < memo->count; i++) {
+    if (!scope->parent && (scope->root_names & memo->root_names)) goto uncached;
+    for (size i = 0; scope->parent && i < memo->count; i++) {
         Str name = memo->names[i];
         const Scope *s = scope;
         while (s->parent) {
@@ -343,7 +349,7 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
             if (item) goto uncached;
             item = s->item;
             binding_index = i;
-        } else if (property(s->root, name)) {
+        } else if (property(s->root, memo->properties[i])) {
             goto uncached;
         }
     }
@@ -382,7 +388,7 @@ static void render_loop(Buf *out, const Node *node, const Scope *scope, uint dep
     if (!v || v->kind != ARRAY || !node->body) return;
     size count = v->array.n;
     Value index = numeric(0), first = boolean(0), last = boolean(0), length = numeric(count);
-    Field fields[] = {{S("index"), &index}, {S("first"), &first}, {S("last"), &last}, {S("length"), &length}};
+    Field fields[] = {{PROP_INDEX, &index}, {PROP_FIRST, &first}, {PROP_LAST, &last}, {PROP_LENGTH, &length}};
     Value loop = record(fields, COUNT(fields));
     Scope child = {.parent = scope, .name = node->text, .loop = &loop};
     for (size i = 0; i < count; i++) {
@@ -424,5 +430,7 @@ static void render_nodes(Buf *out, const Node *nodes, const Scope *scope, uint i
 
 void render_template(Buf *out, const Template *template, const Value *root, const Value *globals) {
     Scope scope = {.root = root, .globals = globals};
+    if (root)
+        for (size i = 0; i < root->record.n; i++) scope.root_names |= 1UL << root->record.items[i].name;
     render_nodes(out, template->nodes, &scope, 0, 0);
 }

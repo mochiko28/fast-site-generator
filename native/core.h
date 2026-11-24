@@ -42,6 +42,7 @@ static inline void put(Buf *buf, char c) {
 Str take(const Buf *buf);
 Str join(size count, const Str *parts);
 #define JOIN(...) join(COUNT(((Str[]){__VA_ARGS__})), (Str[]){__VA_ARGS__})
+Str format_number(char *end, size n);
 Str number(size n);
 size decimal(Str s);
 size find_char(Str s, size at, char c);
@@ -58,10 +59,18 @@ static inline int digit(int c) { return c >= '0' && c <= '9'; }
 static inline int letter(int c) { return (c | 32) >= 'a' && (c | 32) <= 'z'; }
 static inline int lower_digit(int c) { return (c >= 'a' && c <= 'z') || digit(c); }
 static inline int indent(int c) { return c == ' ' || c == '\t'; }
+// The caller supplies a nonzero mask. Use the baseline BSF encoding.
+static inline uint first_bit(uint mask) {
+    uint index;
+    __asm__("bsfl %1, %0" : "=r"(index) : "r"(mask) : "cc");
+    return index;
+}
 
 typedef struct { Str key; void *val; size hash; } Entry;
 typedef struct { Entry *entries; size used, cap; } Map;
+void reserve_map(Map *map, size count);
 void *get(const Map *map, Str key);
+void **entry_value(Map *map, Str key);
 void set(Map *map, Str key, void *val);
 void sort(void **items, size n, int (*order)(const void *, const void *));
 
@@ -83,7 +92,15 @@ Str unique_slug(Map *used, Str slug);
 
 enum ValueKind { NIL, STRING, NUMBER, BOOLEAN, ARRAY, RECORD, RENDERED };
 typedef struct Value Value;
-typedef struct { Str name; const Value *value; } Field;
+enum Property { PROP_UNKNOWN,
+    PROP_BASE_URL, PROP_CONTENT, PROP_COUNT, PROP_DATE, PROP_DATE_LONG, PROP_EXCERPT,
+    PROP_FIRST, PROP_HTML, PROP_ID, PROP_INDEX, PROP_IS_POST, PROP_LAST,
+    PROP_LENGTH, PROP_LEVEL, PROP_NAME, PROP_NEWER, PROP_NEWER_URL, PROP_NUMBER,
+    PROP_OLDER, PROP_OLDER_URL, PROP_PAGE, PROP_PAGER, PROP_POSTS, PROP_READING_MINUTES,
+    PROP_RECENT, PROP_SITE, PROP_SLUG, PROP_SUMMARY, PROP_TAG, PROP_TAGS,
+    PROP_TITLE, PROP_TOC, PROP_TOTAL, PROP_URL
+};
+typedef struct { enum Property name; const Value *value; } Field;
 struct Value {
     enum ValueKind kind;
     union {
@@ -104,7 +121,8 @@ static inline Value record(const Field *items, size n) {
     return (Value){.kind = RECORD, .record = {items, n}};
 }
 
-const Value *property(const Value *value, Str name);
+enum Property property_id(Str name);
+const Value *property(const Value *value, enum Property name);
 static inline Value rendered(Str escaped) { return (Value){.kind = RENDERED, .text = escaped}; }
 
 typedef struct Node Node;
@@ -124,5 +142,20 @@ Markdown markdown(Str body, ResolveLink resolve, void *context);
 size checkpoint(void);
 void rewind_arena(size mark);
 void build_answers(Buf *out, Str input);
+
+enum Phase {
+    SETUP, INPUT, PARSE, FRONT, MARKDOWN, TEMPLATES, SLUGS, SERIALIZE, WRITE, PHASE_COUNT
+};
+#ifdef SITE_PROFILE
+void profile_stage(enum Phase next);
+enum Phase profile_phase(enum Phase next);
+#define PHASE(next) profile_stage(next)
+#define PHASE_BEGIN(name, next) enum Phase name = profile_phase(next)
+#define PHASE_END(name) profile_phase(name)
+#else
+#define PHASE(next) ((void)0)
+#define PHASE_BEGIN(name, next) ((void)0)
+#define PHASE_END(name) ((void)0)
+#endif
 
 #endif

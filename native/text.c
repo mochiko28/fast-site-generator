@@ -1,5 +1,8 @@
 #include "core.h"
 
+typedef char Vec __attribute__((vector_size(16), aligned(1), may_alias));
+#define SPLAT(c) ((Vec){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c})
+
 uint decode(Str s, size *i) {
     uint cp = (byte)s.p[(*i)++];
     if (cp < 0x80) return cp;
@@ -76,7 +79,16 @@ static uint code_unit(Str s, size *i, uint *pending) {
 
 int compare(Str a, Str b) {
     size n = a.n < b.n ? a.n : b.n;
-    for (size i = 0; i < n; i++) {
+    size i = 0;
+    for (; n - i >= 16; i += 16) {
+        Vec x = *(const Vec *)(a.p + i), y = *(const Vec *)(b.p + i);
+        uint different = (uint)__builtin_ia32_pmovmskb128(x == y) ^ 0xffff;
+        if (different) {
+            i += first_bit(different);
+            break;
+        }
+    }
+    for (; i < n; i++) {
         int x = (byte)a.p[i], y = (byte)b.p[i];
         if (x == y) continue;
         if (x < 128 || y < 128) return x - y;
@@ -121,8 +133,8 @@ int has_space(Str s) {
 }
 
 int has_line_separator(Str s) {
-    for (size i = 0; i + 2 < s.n; i++)
-        if ((byte)s.p[i] == 0xe2 && (byte)s.p[i + 1] == 0x80 &&
+    for (size i = 0; (i = find_char(s, i, (char)0xe2)) != NPOS && i + 2 < s.n; i++)
+        if ((byte)s.p[i + 1] == 0x80 &&
             ((byte)s.p[i + 2] == 0xa8 || (byte)s.p[i + 2] == 0xa9)) return 1;
     return 0;
 }
@@ -156,6 +168,10 @@ static const Str entities[128] = {
     ['"'] = S("&quot;"), ['\''] = S("&#39;"),
 };
 static const char hex[] = "0123456789abcdef";
+static const byte escape_class[256] = {
+    [0 ... 31] = 1, ['"'] = 1, ['\\'] = 1, ['&'] = 2, ['<'] = 2, ['>'] = 2, ['\''] = 2,
+    [128 ... 236] = 4, [0xed] = 4 | 8, [238 ... 255] = 4,
+};
 
 void json_code_unit(Buf *out, uint cp) {
     char *p = room(out, 6);
@@ -168,9 +184,6 @@ void json_code_unit(Buf *out, uint cp) {
     out->n += 6;
 }
 
-typedef char Vec __attribute__((vector_size(16), aligned(1), may_alias));
-#define SPLAT(c) ((Vec){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c})
-
 static size next_json(Str s, size i, int html, int unicode) {
     // UTF-8 bytes are all >= 0x80. Bias signed lanes for the unsigned control check.
     for (; s.n - i >= 16; i += 16) {
@@ -180,13 +193,10 @@ static size next_json(Str s, size i, int html, int unicode) {
         if (unicode == 1) hit |= w == SPLAT((char)0xed);
         if (unicode == 2) hit |= w;
         uint mask = __builtin_ia32_pmovmskb128(hit);
-        if (mask) return i + __builtin_ctz(mask);
+        if (mask) return i + first_bit(mask);
     }
-    for (; i < s.n; i++) {
-        uint c = (byte)s.p[i];
-        if (c < 32 || c == '\\' || c == '"' || (unicode == 1 && c == 0xed) || (unicode == 2 && c >= 128) ||
-            (html && c < COUNT(entities) && entities[c].n)) break;
-    }
+    uint mask = 1 | (html ? 2 : 0) | (unicode == 1 ? 8 : unicode == 2 ? 4 : 0);
+    for (; i < s.n && !(escape_class[(byte)s.p[i]] & mask); i++) {}
     return i;
 }
 
@@ -328,21 +338,98 @@ Str slugify(Str s) {
 }
 
 Str unique_slug(Map *used, Str slug) {
-    Str name = slug;
-    for (size n = 2; get(used, name); n++) name = JOIN(slug, S("-"), number(n));
-    set(used, name, (void *)1);
-    return name;
+    void **base = entry_value(used, slug);
+    size next = (size)*base;
+    if (!next) {
+        *base = (void *)2;
+        return slug;
+    }
+    if (next == 1) next = 2;  // A reserved directory.
+    char chars[64 + 1 + 20];
+    if (slug.n > 64) fail();
+    copy(chars, slug.p, slug.n);
+    chars[slug.n] = '-';
+    for (;;) {
+        char digits[20];
+        Str suffix = format_number(digits + sizeof(digits), next++);
+        copy(chars + slug.n + 1, suffix.p, suffix.n);
+        Str candidate = {chars, slug.n + 1 + suffix.n};
+        if (!get(used, candidate)) {
+            Str name = JOIN(candidate);
+            *base = (void *)next;
+            set(used, name, (void *)2);
+            return name;
+        }
+    }
 }
 
-const Value *property(const Value *value, Str name) {
-    if (!value) return 0;
+enum Property property_id(Str name) {
+    switch (name.n) {
+        case 2:
+            if (equal(name, S("id"))) return PROP_ID;
+            break;
+        case 3:
+            if (equal(name, S("tag"))) return PROP_TAG;
+            if (equal(name, S("toc"))) return PROP_TOC;
+            if (equal(name, S("url"))) return PROP_URL;
+            break;
+        case 4:
+            if (equal(name, S("date"))) return PROP_DATE;
+            if (equal(name, S("html"))) return PROP_HTML;
+            if (equal(name, S("last"))) return PROP_LAST;
+            if (equal(name, S("name"))) return PROP_NAME;
+            if (equal(name, S("page"))) return PROP_PAGE;
+            if (equal(name, S("site"))) return PROP_SITE;
+            if (equal(name, S("slug"))) return PROP_SLUG;
+            if (equal(name, S("tags"))) return PROP_TAGS;
+            break;
+        case 5:
+            if (equal(name, S("count"))) return PROP_COUNT;
+            if (equal(name, S("first"))) return PROP_FIRST;
+            if (equal(name, S("index"))) return PROP_INDEX;
+            if (equal(name, S("level"))) return PROP_LEVEL;
+            if (equal(name, S("newer"))) return PROP_NEWER;
+            if (equal(name, S("older"))) return PROP_OLDER;
+            if (equal(name, S("pager"))) return PROP_PAGER;
+            if (equal(name, S("posts"))) return PROP_POSTS;
+            if (equal(name, S("title"))) return PROP_TITLE;
+            if (equal(name, S("total"))) return PROP_TOTAL;
+            break;
+        case 6:
+            if (equal(name, S("length"))) return PROP_LENGTH;
+            if (equal(name, S("number"))) return PROP_NUMBER;
+            if (equal(name, S("recent"))) return PROP_RECENT;
+            break;
+        case 7:
+            if (equal(name, S("content"))) return PROP_CONTENT;
+            if (equal(name, S("excerpt"))) return PROP_EXCERPT;
+            if (equal(name, S("is_post"))) return PROP_IS_POST;
+            if (equal(name, S("summary"))) return PROP_SUMMARY;
+            break;
+        case 8:
+            if (equal(name, S("base_url"))) return PROP_BASE_URL;
+            break;
+        case 9:
+            if (equal(name, S("date_long"))) return PROP_DATE_LONG;
+            if (equal(name, S("newer_url"))) return PROP_NEWER_URL;
+            if (equal(name, S("older_url"))) return PROP_OLDER_URL;
+            break;
+        case 15:
+            if (equal(name, S("reading_minutes"))) return PROP_READING_MINUTES;
+            break;
+    }
+    return PROP_UNKNOWN;
+}
+
+const Value *property(const Value *value, enum Property name) {
+    if (!value || name == PROP_UNKNOWN) return 0;
     if (value->kind == RECORD) {
         for (size i = 0; i < value->record.n; i++) {
             const Field *f = &value->record.items[i];
-            if (equal(name, f->name)) return f->value;
+            if (name == f->name) return f->value;
         }
     }
-    if (value->kind == ARRAY && equal(name, S("length"))) {
+    if (value->kind == ARRAY && name == PROP_LENGTH) {
         // Template paths cannot contain a numeric segment.
         static Value length;
         length = numeric(value->array.n);

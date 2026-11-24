@@ -40,8 +40,8 @@ _Noreturn void fail(void) {
 }
 
 void *alloc(size element, size count) {
-    if (count && element > (ALLOC_LIMIT - used) / count) fail();
-    size bytes = element * count;
+    size bytes;
+    if (__builtin_mul_overflow(element, count, &bytes) || bytes > ALLOC_LIMIT - used) fail();
     size aligned = (bytes + 7) & ~7UL;
     if (aligned > ALLOC_LIMIT - used) fail();
     void *result = arena + used;
@@ -57,6 +57,11 @@ typedef char Vector __attribute__((vector_size(16), aligned(1), may_alias));
 void copy(void *dst, const void *src, size n) {
     char *d = dst;
     const char *s = src;
+    // The JSON decoder also uses this with a destination below its source.
+    if (n >= 128) {
+        __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
+        return;
+    }
     while (n >= 16) {
         *(Vector *)d = *(const Vector *)s;
         d += 16;
@@ -64,11 +69,13 @@ void copy(void *dst, const void *src, size n) {
         n -= 16;
     }
     if (n >= 8) {
-        *(Word *)d = *(const Word *)s;
-        *(Word *)(d + n - 8) = *(const Word *)(s + n - 8);
+        Word first = *(const Word *)s, last = *(const Word *)(s + n - 8);
+        *(Word *)d = first;
+        *(Word *)(d + n - 8) = last;
     } else if (n >= 4) {
-        *(Half *)d = *(const Half *)s;
-        *(Half *)(d + n - 4) = *(const Half *)(s + n - 4);
+        Half first = *(const Half *)s, last = *(const Half *)(s + n - 4);
+        *(Half *)d = first;
+        *(Half *)(d + n - 4) = last;
     } else if (n >= 2) {
         *(Pair *)d = *(const Pair *)s;
         d[n - 1] = s[n - 1];
@@ -131,14 +138,18 @@ Str join(size count, const Str *parts) {
     return (Str){p, n};
 }
 
-Str number(size n) {
-    char digits[24];
-    size i = sizeof(digits);
+Str format_number(char *end, size n) {
+    char *first = end;
     do {
-        digits[--i] = '0' + n % 10;
+        *--first = '0' + n % 10;
         n /= 10;
     } while (n);
-    return JOIN(((Str){digits + i, sizeof(digits) - i}));
+    return (Str){first, end - first};
+}
+
+Str number(size n) {
+    char digits[20];
+    return JOIN(format_number(digits + sizeof(digits), n));
 }
 
 size decimal(Str s) {
@@ -151,7 +162,7 @@ size find_char(Str s, size i, char c) {
     Vector needle = (Vector){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c};
     for (; i < s.n && s.n - i >= 16; i += 16) {
         int mask = __builtin_ia32_pmovmskb128(*(const Vector *)(s.p + i) == needle);
-        if (mask) return i + __builtin_ctz((uint)mask);
+        if (mask) return i + first_bit((uint)mask);
     }
     for (; i < s.n; i++) if (s.p[i] == c) return i;
     return NPOS;
@@ -183,7 +194,8 @@ static size hash(Str s) {
     size i = 0;
     for (; s.n - i >= 8; i += 8) h = (h ^ (size)*(const Word *)(s.p + i)) * 0x100000001b3UL;
     for (; i < s.n; i++) h = (h ^ (byte)s.p[i]) * 0x100000001b3UL;
-    return (h ^ (h >> 32)) | 1;
+    h ^= h >> 32;
+    return h ? h : 1;
 }
 
 static Entry *slot(const Map *map, Str key, size h) {
@@ -201,19 +213,38 @@ void *get(const Map *map, Str key) {
     return map->cap ? slot(map, key, hash(key))->val : 0;
 }
 
-void set(Map *map, Str key, void *val) {
-    if (map->used * 2 >= map->cap) {
-        Entry *old = map->entries;
-        size count = map->cap;
-        map->cap = count ? count * 2 : 16;
-        map->entries = zero(NEW(Entry, map->cap), map->cap * sizeof(Entry));
-        for (size i = 0; i < count; i++)
-            if (old[i].hash) *slot(map, old[i].key, old[i].hash) = old[i];
-    }
+void reserve_map(Map *map, size count) {
+    if (count <= map->cap / 2) return;
+    if (count > ALLOC_LIMIT / sizeof(Entry) / 2) fail();
+    size cap = map->cap ? map->cap * 2 : 16;
+    while (count > cap / 2) cap *= 2;
+    Entry *entries = NEW(Entry, cap);
+    zero(entries, cap * sizeof(*entries));
+    Map old = *map;
+    map->cap = cap;
+    map->entries = entries;
+    for (size i = 0; i < old.cap; i++)
+        if (old.entries[i].hash)
+            *slot(map, old.entries[i].key, old.entries[i].hash) = old.entries[i];
+}
+
+void **entry_value(Map *map, Str key) {
     size h = hash(key);
+    if (!map->cap) reserve_map(map, 1);
     Entry *e = slot(map, key, h);
-    map->used += !e->hash;
-    *e = (Entry){key, val, h};
+    if (!e->hash) {
+        if (map->used == map->cap / 2) {
+            reserve_map(map, map->used + 1);
+            e = slot(map, key, h);
+        }
+        map->used++;
+        *e = (Entry){key, 0, h};
+    }
+    return &e->val;
+}
+
+void set(Map *map, Str key, void *val) {
+    *entry_value(map, key) = val;
 }
 
 static void merge_sort(void **items, void **tmp, size n, int (*order)(const void *, const void *)) {
@@ -326,13 +357,109 @@ static int publish(Str path, const Buf *out) {
     return 0;
 }
 
+#ifdef SITE_PROFILE
+// Linux x86-64 struct rusage uses two timevals followed by fourteen longs.
+typedef struct {
+    long user[2], system[2], maxrss, ixrss, idrss, isrss, minor, major, rest[8];
+} Usage;
+
+static const Str phase_names[] = {
+    S("setup"), S("input"), S("parse"), S("front"), S("markdown"),
+    S("templates"), S("slugs"), S("serialize"), S("write"),
+};
+_Static_assert(COUNT(phase_names) == PHASE_COUNT, "phase names");
+
+static size cycles[PHASE_COUNT], cpu[PHASE_COUNT];
+static size last_cycle, last_cpu, cpu_start, startup_cpu;
+static enum Phase current_phase;
+static Usage usage_start;
+static int usage_ok;
+
+static size cpu_time(long clock) {
+    long ts[2];
+    if (sys3(228, clock, (long)ts, 0) < 0) return 0;  // clock_gettime
+    return ts[0] * 1000000000UL + ts[1];
+}
+
+static size ticks(void) {
+    uint lo, hi;
+    __asm__ volatile ("lfence; rdtsc" : "=a"(lo), "=d"(hi) : : "memory");
+    return ((size)hi << 32) | lo;
+}
+
+enum Phase profile_phase(enum Phase next) {
+    size now = ticks();
+    enum Phase previous = current_phase;
+    cycles[previous] += now - last_cycle;
+    last_cycle = now;
+    current_phase = next;
+    return previous;
+}
+
+void profile_stage(enum Phase next) {
+    if (current_phase == next) return;
+    profile_phase(next);
+    size now = cpu_time(3);
+    size total = 0;
+    for (size i = 0; i < PHASE_COUNT; i++) total += cycles[i];
+    // Subdivide each stage's CPU time using TSC for its short nested phases.
+    for (size i = 0; i < PHASE_COUNT; i++) {
+        if (!cycles[i]) continue;
+        cpu[i] += (now - last_cpu) * ((double)cycles[i] / total);
+        cycles[i] = 0;
+    }
+    last_cpu = now;
+    last_cycle = ticks();
+}
+
+static void profile_start(void) {
+    startup_cpu = cpu_time(2);  // CLOCK_PROCESS_CPUTIME_ID
+    usage_ok = sys3(98, 0, (long)&usage_start, 0) == 0;  // getrusage(RUSAGE_SELF)
+    current_phase = SETUP;
+    zero(cycles, sizeof(cycles));
+    zero(cpu, sizeof(cpu));
+    last_cpu = cpu_start = cpu_time(3);  // CLOCK_THREAD_CPUTIME_ID
+    last_cycle = ticks();
+}
+
+static void profile_field(Buf *out, Str key, size value) {
+    append(out, key);
+    put(out, '=');
+    append(out, number(value));
+    put(out, ' ');
+}
+
+static void profile_finish(void) {
+    PHASE(SETUP);
+    size elapsed = cpu_time(3) - cpu_start;
+    Usage end;
+    int have_usage = usage_ok && sys3(98, 0, (long)&end, 0) == 0;
+    Buf out = {0};
+    profile_field(&out, S("native_ns"), elapsed);
+    profile_field(&out, S("startup_process_ns"), startup_cpu);
+    if (have_usage) {
+        profile_field(&out, S("minflt"), end.minor - usage_start.minor);
+        profile_field(&out, S("majflt"), end.major - usage_start.major);
+    }
+    for (size i = 0; i < PHASE_COUNT; i++)
+        profile_field(&out, phase_names[i], cpu[i] / 1000);
+    put(&out, '\n');
+    sys3(SYS_WRITE, 2, (long)out.p, out.n);
+}
+#endif
+
 static void job(void) {
     Str input, output;
     paths(&input, &output);
+    PHASE(INPUT);
     Str source = read_input(input.p);
     Buf answer = {arena, 0, OUTPUT_LIMIT};
     build_answers(&answer, source);
+    PHASE(WRITE);
     if (!publish(output, &answer)) fail();
+#ifdef SITE_PROFILE
+    profile_finish();
+#endif
     sys3(SYS_EXIT_GROUP, 0, 0, 0);
     __builtin_trap();
 }
@@ -340,6 +467,9 @@ static void job(void) {
 __attribute__((visibility("default")))
 void *napi_register_module_v1(void *env, void *exports) {
     (void)env;
+#ifdef SITE_PROFILE
+    profile_start();
+#endif
     long address = map_arena();
     if ((size)address >= (size)-4095) return exports;
     arena = (char *)address;

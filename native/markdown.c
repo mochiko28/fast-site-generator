@@ -38,115 +38,104 @@ static uint marks(Vec bytes) {
     return __builtin_ia32_pmovmskb128(hit);
 }
 
+// Copy plain runs as they are scanned. A vector store can include the mark
+// and bytes past it, which the following token overwrites as needed.
+static size copy_inline_text(Buf *out, Str s, size i) {
+    size from = i;
+    char *dst = room(out, s.n - i);
+    for (; s.n - i >= 16; i += 16) {
+        Vec bytes = *(const Vec *)(s.p + i);
+        *(Vec *)(dst + i - from) = bytes;
+        uint hit = marks(bytes);
+        if (hit) {
+            i += first_bit(hit);
+            out->n += i - from;
+            return i;
+        }
+    }
+    if (i < s.n) {
+        // A Markdown slice has a readable SIMD tail in the arena.
+        uint hit = marks(*(const Vec *)(s.p + i)) & ((1u << (s.n - i)) - 1);
+        size n = hit ? (size)first_bit(hit) : s.n - i;
+        copy(dst + i - from, s.p + i, n);
+        i += n;
+    }
+    out->n += i - from;
+    return i;
+}
+
 static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uint depth) {
     if (depth > 128) fail();
-    // A match can consume later matches in the same vector.
-    size from = 0, base = 0, block_start = 0;
-    uint pending = 0;
-    while (base < s.n || pending) {
-        if (!pending) {
-            // Markdown slices point into the arena, which has a readable SIMD tail.
-            block_start = base;
-            pending = marks(*(const Vec *)(s.p + base));
-            size left = s.n - base;
-            if (left < 16) {
-                pending &= (1u << left) - 1;
-                base = s.n;
-            } else {
-                base += 16;
-            }
-            if (!pending) continue;
-        }
-        size i = block_start + __builtin_ctz(pending);
-        pending &= pending - 1;
-        if (i < from) continue;
-
-        int c = (byte)s.p[i];
+    int labels = 1;
+    for (size i = 0; i < s.n && (i = copy_inline_text(out, s, i)) < s.n;) {
+        unsigned c = (byte)s.p[i];
         size next = i + 1;
-        Str prefix = {0}, suffix = {0}, fragment = {0}, href = {0};
-        int mode = 0;
-        if (c < (int)COUNT(escapes) && escapes[c].n) {
-            prefix = escapes[c];
+        if (c == '\n') {
+            ADD(out, "\\n");
+        } else if (c < COUNT(escapes) && escapes[c].n) {
+            append(out, escapes[c]);
+        } else if (c <= 31) {
+            json_ascii(out, c);
         } else if (c == '\\') {
-            if (escapable(at(s, next))) {
-                c = s.p[next++];
-                if (c == '>') prefix = escapes[c];
-                else if (c == '\\') prefix = S("\\\\");
-                else prefix = slice(s, next - 1, next);
-            } else {
-                prefix = S("\\\\");
+            c = at(s, next);
+            if (!escapable(c)) ADD(out, "\\\\");
+            else {
+                next++;
+                if (c == '>') ADD(out, "&gt;");
+                else if (c == '\\') ADD(out, "\\\\");
+                else put(out, c);
             }
         } else if (c == '`') {
             size end = find_char(s, next, '`');
-            if (end == NPOS || end == next) continue;
-            prefix = S("<code>");
-            suffix = S("</code>");
-            fragment = slice(s, next, end);
+            if (end == NPOS || end == next) goto literal;
+            ADD(out, "<code>");
+            json(out, slice(s, next, end), 1, 0);
+            ADD(out, "</code>");
             next = end + 1;
-            mode = 1;
         } else if (c == '*') {
             int strong = at(s, next) == '*';
             next += strong;
             size end = closer(s, next, strong ? S("**") : S("*"), !strong);
             if (end == NPOS || end == next) {
-                if (strong) {
-                    append(out, slice(s, from, next));
-                    from = next;
-                }
+                put(out, '*');
+                if (strong) put(out, '*');
+                i = next;
                 continue;
             }
-            prefix = strong ? S("<strong>") : S("<em>");
-            suffix = strong ? S("</strong>") : S("</em>");
-            fragment = slice(s, next, end);
+            append(out, strong ? S("<strong>") : S("<em>"));
+            inline_html(out, slice(s, next, end), resolve, context, depth + 1);
+            append(out, strong ? S("</strong>") : S("</em>"));
             next = end + 1 + strong;
-            mode = 2;
-        } else if (c == '[') {
+        } else if (c == '[' && labels) {
             size label_end = closer(s, next, S("]"), 0);
-            if (label_end == NPOS || at(s, label_end + 1) != '(') continue;
+            if (label_end == NPOS) {
+                labels = 0;
+                goto literal;
+            }
+            if (at(s, label_end + 1) != '(') goto literal;
             size end = find_char(s, label_end + 2, ')');
-            if (end == NPOS || end == label_end + 2) continue;
+            if (end == NPOS || end == label_end + 2) goto literal;
             Str target = slice(s, label_end + 2, end);
-            if (has_space(target)) continue;
-            href = resolve(context, target);
-            prefix = S("<a href=\\\"");
-            suffix = S("</a>");
-            fragment = slice(s, next, label_end);
+            if (has_space(target)) goto literal;
+            Str href = resolve(context, target);
+            ADD(out, "<a href=\\\"");
+            json(out, href, 1, 0);
+            ADD(out, "\\\">");
+            inline_html(out, slice(s, next, label_end), resolve, context, depth + 1);
+            ADD(out, "</a>");
             next = end + 1;
-            mode = 2;
-        } else if (c <= 31) {
-            append(out, slice(s, from, i));
-            json_ascii(out, c);
-            from = next;
-            continue;
         } else if (c == 0xed && !latin1) {
             next = i;
             uint cp = decode(s, &next);
-            if (cp >= 0xd800 && cp <= 0xdfff) {
-                append(out, slice(s, from, i));
-                json_code_unit(out, cp);
-                from = next;
-            }
-            continue;
+            if (cp < 0xd800 || cp > 0xdfff) goto literal;
+            json_code_unit(out, cp);
         } else {
-            continue;
+literal:
+            put(out, s.p[i]);
+            next = i + 1;
         }
-
-        append(out, slice(s, from, i));
-        append(out, prefix);
-        if (c == '[' && suffix.n) {
-            json(out, href, 1, 0);
-            ADD(out, "\\\">");
-        }
-        if (mode == 1) json(out, fragment, 1, 0);
-        else if (mode == 2) inline_html(out, fragment, resolve, context, depth + 1);
-        append(out, suffix);
-        from = next;
-        if (next >= base) {
-            base = next;
-            pending = 0;
-        }
+        i = next;
     }
-    append(out, tail(s, from));
 }
 
 enum Block { PARAGRAPH, FENCE = 7, BREAK, BLANK };
@@ -191,7 +180,23 @@ static int continued(Str line) {
     return i < line.n && !space_width(line, i);
 }
 
-typedef struct { Str body, line; size at, end; } Lines;
+typedef struct {
+    Str body, line;
+    size at, end, next;
+    uint *ends;
+    size count, cap;
+} Lines;
+
+static void add_line_end(Lines *lines, size end) {
+    if (lines->count == lines->cap) {
+        size cap = lines->cap * 2;
+        uint *ends = NEW(uint, cap);
+        copy(ends, lines->ends, lines->count * sizeof(*ends));
+        lines->ends = ends;
+        lines->cap = cap;
+    }
+    lines->ends[lines->count++] = end;
+}
 
 static void advance(Lines *lines) {
     lines->at = lines->end + 1;
@@ -199,8 +204,7 @@ static void advance(Lines *lines) {
         lines->line = (Str){0};
         return;
     }
-    size end = find_char(lines->body, lines->at, '\n');
-    lines->end = end == NPOS ? lines->body.n : end;
+    lines->end = lines->ends[lines->next++];
     lines->line = slice(lines->body, lines->at, lines->end);
 }
 
@@ -307,39 +311,53 @@ static uint bit_count(uint bits) {
     return (bits + (bits >> 8)) & 31;
 }
 
-static size reading_minutes(Str body) {
-    if (body.n <= 400) return 1;
+// Index line boundaries and count word starts in the same pass.
+static size index_lines(Lines *lines) {
+    Str body = lines->body;
+    int count_words = body.n > 400;
     size words = 0, i = 0;
-    uint last = 1;
+    uint last = 1, carry = 0;
     for (; body.n - i >= 16; i += 16) {
         Vec w = *(const Vec *)(body.p + i);
-        Vec ws = (w == SPLAT(' ')) | ((w > SPLAT(8)) & (w < SPLAT(14)));
-        uint gaps = __builtin_ia32_pmovmskb128(ws);
-        uint unicode = __builtin_ia32_pmovmskb128(
-            (w == SPLAT((char)0xc2)) | (w == SPLAT((char)0xe1)) | (w == SPLAT((char)0xe2)) |
-            (w == SPLAT((char)0xe3)) | (w == SPLAT((char)0xef)));
-        if (unicode) {
-            do {
-                uint j = __builtin_ctz(unicode);
-                if (space_width(body, i + j)) goto scalar;
-                unicode &= unicode - 1;
-            } while (unicode);
+        Vec lf = w == SPLAT('\n');
+        uint breaks = __builtin_ia32_pmovmskb128(lf);
+        for (uint bits = breaks; bits; bits &= bits - 1)
+            add_line_end(lines, i + first_bit(bits));
+
+        if (count_words) {
+            Vec ws = (w == SPLAT(' ')) | ((w > SPLAT(8)) & (w < SPLAT(14)));
+            uint gaps = carry | (uint)__builtin_ia32_pmovmskb128(ws);
+            uint unicode = __builtin_ia32_pmovmskb128(
+                (w == SPLAT((char)0xc2)) | (w == SPLAT((char)0xe1)) | (w == SPLAT((char)0xe2)) |
+                (w == SPLAT((char)0xe3)) | (w == SPLAT((char)0xef)));
+            for (; unicode; unicode &= unicode - 1) {
+                uint j = first_bit(unicode);
+                size width = space_width(body, i + j);
+                gaps |= ((1u << width) - 1) << j;
+            }
+            words += bit_count(~gaps & ((gaps << 1) | last) & 0xffff);
+            last = (gaps >> 15) & 1;
+            carry = gaps >> 16;
         }
-        words += bit_count(~gaps & ((gaps << 1) | last) & 0xffff);
-        last = gaps >> 15;
     }
-scalar:
+
+    // A multibyte whitespace character can straddle the final vector and tail.
+    i += (carry & 1) + (carry >> 1);
     while (i < body.n) {
-        size width = space_width(body, i);
-        if (width) {
-            last = 1;
-            i += width;
-        } else {
+        if (body.p[i] == '\n') add_line_end(lines, i);
+        if (count_words) {
+            size width = space_width(body, i);
+            if (width) {
+                last = 1;
+                i += width;
+                continue;
+            }
             words += last;
             last = 0;
-            i++;
         }
+        i++;
     }
+    add_line_end(lines, body.n);
     return words ? (words + 199) / 200 : 1;
 }
 
@@ -351,14 +369,16 @@ struct Heading {
 };
 
 Markdown markdown(Str body, ResolveLink resolve, void *context) {
-    Markdown result = {.excerpt = {.kind = RENDERED}, .minutes = reading_minutes(body)};
+    uint line_ends[128];
+    Lines lines = {.body = body, .end = NPOS, .ends = line_ends, .cap = COUNT(line_ends)};
+    Markdown result = {.excerpt = {.kind = RENDERED}, .minutes = index_lines(&lines)};
     Buf html = {0};
     if (body.n) room(&html, body.n + body.n / 2 + 128);
-    Map ids = {0};
+    Entry local_ids[8] = {0};
+    Map ids = {.entries = local_ids, .cap = COUNT(local_ids)};
     Heading *toc = 0, **next = &toc;
     size count = 0;
     int excerpt = 0;
-    Lines lines = {.body = body, .end = NPOS};
     advance(&lines);
     int kind = block(lines.line);
 
@@ -372,7 +392,9 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
             advance(&lines);
         } else if (kind != PARAGRAPH) {
             Str text = trim_line(tail(lines.line, kind));
+            PHASE_BEGIN(markdown_phase, SLUGS);
             Str id = unique_slug(&ids, slugify(text));
+            PHASE_END(markdown_phase);
             ADD(&html, "<h");
             put(&html, '0' + kind);
             ADD(&html, " id=\\\"");
@@ -386,9 +408,9 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
                 heading->level = numeric(kind);
                 heading->id = string(id);
                 heading->html = rendered(tail(take(&html), from));
-                heading->fields[0] = (Field){S("level"), &heading->level};
-                heading->fields[1] = (Field){S("id"), &heading->id};
-                heading->fields[2] = (Field){S("html"), &heading->html};
+                heading->fields[0] = (Field){PROP_LEVEL, &heading->level};
+                heading->fields[1] = (Field){PROP_ID, &heading->id};
+                heading->fields[2] = (Field){PROP_HTML, &heading->html};
                 heading->item = record(heading->fields, COUNT(heading->fields));
                 *next = heading;
                 next = &heading->next;

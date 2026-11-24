@@ -16,16 +16,21 @@ The nine-run practice median was 269 ms, down from 279 ms for v3. All 43 sets pa
 
 ## Native addon
 
-Run `native/build.sh` to rebuild the Linux x86-64 `site.node` with GCC. The addon has no dynamic dependencies or versioned symbols. `main.ts` loads it before the JS driver. The addon reads both directory overrides from the initial environment, builds the cases in a single arena, and buffers the answer across cases. It writes a sibling temporary file, renames it into place after the write and close succeed, and calls `exit_group(0)`. An unsupported input or failed native check returns to the JS driver. The arena reserves 384 MiB of virtual address space, with 128 MiB available for the final JSON. Scratch allocations are reused between cases.
+Run `native/build.sh` to rebuild the Linux x86-64 `site.node` with GCC. The build uses the baseline x86-64 ISA and has no undefined dynamic symbols, dynamic dependencies, or versioned symbols. `main.ts` loads the addon first. If native processing returns, `main.ts` loads the original JS driver from `fallback.js`.
 
-Generated inputs parse in one pass. If an escaped non-ASCII code unit selects UTF-16 mode, the addon restarts the buffered build in that mode. Strings use UTF-8 with a representation for isolated surrogates. Comparisons follow UTF-16 code-unit order, and Markdown word counts use JavaScript's whitespace set. `native/gen-unicode.mjs` generates the slug table from Node 22.23.5's Unicode 17.0 NFKD and mark classification. The table projects the result onto ASCII alphanumerics and separators after dropping marks. Markdown produces JSON-escaped HTML as it renders, and template includes reuse output when their referenced bindings permit it.
+The addon reads both directory overrides from the initial environment and reads the input directly into its arena. A raw escape scan selects the string mode before the parser decodes strings in place. The parser also records carriage returns so Markdown normalization can skip unaffected files. Strings use UTF-8 with a representation for isolated surrogates. Comparisons follow UTF-16 code-unit order, and Markdown word counts use JavaScript's whitespace set. `native/gen-unicode.mjs` generates the slug table from Node 22.23.5's Unicode 17.0 NFKD and mark classification. The table projects the result onto ASCII alphanumerics and separators after dropping marks.
+
+Markdown indexes line breaks and counts words in one pass, then copies ordinary inline runs while scanning for marks and emits JSON-escaped HTML for replacements. Templates compile record properties to numeric IDs and reuse included output when their referenced bindings permit it. Known map sizes are reserved up front, larger tag lists deduplicate by hash, and each base slug remembers the next suffix to try.
+
+The arena reserves 384 MiB of virtual address space with 128 MiB available for the final JSON. Scratch allocations are reused between cases. Templates write into the final JSON buffer. The common path writes that buffer to a sibling temporary file in one syscall, closes it, renames it into place, and calls `exit_group(0)`. The write loop handles interrupted and short writes. Failed native processing leaves the previous answer available to the fallback.
 
 ### Verification
 
-- The kit generator and oracle produced 315 sites from 105 distinct SHA-256 seeds. All answer files matched the oracle byte for byte. The native path handled all 315 sites.
-- `test.sh`, `test2.sh`, and `test3.sh` produced 9, 16, and 8 `OK` lines. All 20 sets in `cases4` and `cases5` passed through C, including both copies of `edge` and `edge-utf16`.
+- The final build matched the oracle byte for byte on all 315 sites generated from the original 105 SHA-256 seeds. The fallback probe recorded zero fallbacks.
+- `test.sh`, `test2.sh`, and `test3.sh` produced 9, 16, and 8 `OK` lines. All 20 sets in `cases4` and `cases5` passed, including both copies of `edge` and `edge-utf16`.
+- All 53 runs from those five test groups also produced answer files byte-identical to `cand6`.
 - Another 200 synthetic inputs matched the JS driver's output bytes, covering both encoding modes, higher Unicode code points, isolated surrogates, control characters, and mixed-mode detection after earlier cases. A batch with unsupported fractional pagination preserved the existing output on native failure, then the JS fallback produced the expected bytes.
-- The kit's process-driver worktree grade returned `{"cases_passed":3,"cases_total":3,"passed":1}`. The CLI defaults to grading HEAD, so `--worktree` was used for the uncommitted addon. In this sandbox a scratch preload redirected unused Git subprocess stdin from a pipe to `/dev/null` to avoid `spawnSync git EPERM`.
+- The previous native pass's process-driver worktree grade returned `{"cases_passed":3,"cases_total":3,"passed":1}`. The CLI defaults to grading HEAD, so `--worktree` was used for that run.
 
 The instrumented JS port measured non-ASCII text on the same 315 generated sites.
 
@@ -38,4 +43,34 @@ The instrumented JS port measured non-ASCII text on the same 315 generated sites
 
 ### Practice CPU time
 
-The 11-run `ru.py` medians were 268 ms for `v5base`, 112 ms for the native entry, and 88 ms for the kit's null entry. Subtracting the control median gives 180 ms for `v5base` and 24 ms for the native entry. In a separate 21-run comparison with the full driver, `require` and `process.dlopen` both had a 113 ms median. The entry uses the shorter `require` call. An instrumented build measured 30.1 ms of native thread CPU time for the three practice cases, including file I/O. The native stage exceeded the 10 ms target on this host.
+The requested 21-run comparison used the production binaries and the original kit null entry.
+
+```text
+$ python3 /work/.tmp/ru.py 21 /work/.tmp/cand6 /work/entry /work/.tmp/t12/null
+/work/.tmp/cand6             user 85 sys 24 total 108 minflt 6807 vcsw 15
+/work/entry                  user 74 sys 23 total 97 minflt 6738 vcsw 15
+/work/.tmp/t12/null          user 67 sys 20 total 87 minflt 7044 vcsw 20
+```
+
+CPU time above the kit null entry fell from 21 ms to 10 ms. A separate 21-run comparison with the literally empty `main.ts` measured 108 ms for `cand6`, 98 ms for the final entry, and 71 ms for the control. The corresponding net times were 37 ms and 27 ms.
+
+Build with `native/build.sh -DSITE_PROFILE` to print phase times on stderr. The profiler measures thread CPU time at stage boundaries with `clock_gettime`, uses `rdtsc` to subdivide short nested phases, and records process fault deltas with `getrusage`. It reports phase durations in microseconds and total and startup CPU time in nanoseconds. Rebuild without the define for scoring.
+
+| Practice phase | Baseline ms | Final ms |
+| --- | ---: | ---: |
+| Arena and environment | 0.500 | 0.509 |
+| Input read | 0.669 | 0.684 |
+| JSON parse | 3.001 | 2.804 |
+| Front matter and site preparation | 1.872 | 1.383 |
+| Markdown | 12.414 | 10.329 |
+| Template compilation and rendering | 5.771 | 3.982 |
+| Page and heading slugs | 1.012 | 0.633 |
+| Output keys, statics and report serialization | 0.460 | 0.330 |
+| Write, close and rename | 3.675 | 3.698 |
+| **Total native thread CPU** | **29.561** | **24.683** |
+| Minor faults during native processing | 12 | 11 |
+| Major faults during native processing | 0 | 0 |
+
+Each row is the median of 21 interleaved runs. Markdown remained the largest phase, and native CPU time was above the 8 ms target. Prefaulting 8 MiB of each arena region with `MADV_POPULATE_WRITE` measured 24.867 ms and 11 minor faults. The production arena remains lazy.
+
+In a separate 21-run startup comparison, process CPU measured at addon entry was 76.184 ms with the original driver, 70.836 ms with the two-line `require` driver, and 70.556 ms with the two-line `process.dlopen` driver. The control measured 72.191 ms at its first statement. The entry uses `require`.
