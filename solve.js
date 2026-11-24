@@ -936,16 +936,22 @@ function hasUnicodeByteSpace(body) {
 const ASCII_WORD_GROUP = /[^\t-\r ]+(?:[\t-\r ]+[^\t-\r ]+){0,199}/g;
 const WORD_GROUP = /\S+(?:\s+\S+){0,199}/g;
 
+function countWordGroups(body, pattern) {
+  let count = 0;
+  while (pattern.test(body)) count++;
+  return Math.max(1, count);
+}
+
 function readingMinutes(body, latin1) {
   // A 201st word needs at least 401 code units including its separators.
   if (body.length <= 400) return 1;
   // The number of matches is ceil(words / 200). In byte mode every
   // Unicode whitespace character has one of the sequences in BYTE_SPACE.
   if (latin1 && !hasUnicodeByteSpace(body)) {
-    return Math.max(1, body.match(ASCII_WORD_GROUP)?.length ?? 0);
+    return countWordGroups(body, ASCII_WORD_GROUP);
   }
   if (latin1) body = decode(body);
-  return Math.max(1, body.match(WORD_GROUP)?.length ?? 0);
+  return countWordGroups(body, WORD_GROUP);
 }
 
 function linkRecord(source) {
@@ -1082,6 +1088,8 @@ function run(input, opts) {
   const tagScope = templates.scope(['tag']);
   const emptyScope = templates.scope([]);
 
+  const writeChunk = opts?.writeChunk;
+  const chunkSize = opts?.chunkSize;
   let files = '';
   let comma = '{';
   const written = new Set();
@@ -1089,6 +1097,11 @@ function run(input, opts) {
     written.add(path);
     files += comma + JSON.stringify(path) + ':"' + escaped + '"';
     comma = ',';
+    // Keep each JSON member intact and release the written strings as a batch.
+    if (writeChunk !== undefined && files.length >= chunkSize) {
+      writeChunk(files);
+      files = '';
+    }
   };
   for (const source of sources) {
     const page = {
@@ -1139,6 +1152,7 @@ function run(input, opts) {
     + tags.length + ' tags and ' + statics.length + ' static files');
   write('build-report.txt', jsonText(report.join('\n') + '\n'));
   const answer = files + '}';
+  if (writeChunk !== undefined) return writeChunk(answer);
   return opts?.json ? answer : JSON.parse(answer);
 }
 

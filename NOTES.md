@@ -13,3 +13,7 @@ Templates compile against numeric scope slots. Compilation folds constant expres
 The latest pass matches common front-matter layouts in one native call and uses the general parser for detailed errors. It trims slug edges by index, bypasses relative resolution for absolute links, and skips the word scan for bodies of at most 400 code units. Each build caches escaped template strings of at most 128 code units and concatenates the answer for the driver to flatten on write.
 
 The nine-run practice median was 269 ms, down from 279 ms for v3. All 43 sets passed and their answer files matched v3 byte for byte. That includes eight new seeded sets and targeted cases in both encoding modes. The paragraph scan, guarded inline replacements, and GC settings tested in this pass were dropped after timing them.
+
+The driver releases the input text after parsing and drops each case from the input array as its build starts. Output is flushed at file boundaries after accumulating 32 KiB, so written strings can be collected during the build. Reading time counts word-group matches without retaining the matched strings. V8 uses a semi-space growth factor of 1 and disables parallel scavenging and background minor GC tasks.
+
+Against v5base, nine-run practice medians went from 20,337 to 11,907 minor faults and from 169 to 167 ms total CPU. Median peak RSS fell from 114,212 to 80,352 KiB. All 53 sets passed and matched v5base byte for byte.
