@@ -127,7 +127,9 @@ static Str read_string(Parser *p, int *has_cr) {
             if (hits || input.n - from < 16) {
                 size n = hits ? first_bit(hits) : 16;
                 if (n > input.n - from) n = input.n - from;
-                copy(write, input.p + from, n);
+                // Widen the copy only when it stays clear of the unread source.
+                if (input.p + from + n - write >= 16) *(Vec *)write = bytes;
+                else copy(write, input.p + from, n);
                 write += n;
                 end = from + n;
                 break;
@@ -173,14 +175,16 @@ static Json *read_value(Parser *p, uint depth) {
     if (depth > 128) fail();
     int first = peek(p);
     Json *value = NEW(Json, 1);
-    *value = (Json){0};
+    value->next = 0;
     if (first == '"') {
         value->kind = JSTRING;
+        value->has_cr = 0;
         value->text = read_string(p, &value->has_cr);
     } else if (first == '[' || first == '{') {
         value->kind = first == '[' ? JARRAY : JOBJECT;
         int close = first == '[' ? ']' : '}';
         p->pos++;
+        value->count = 0;
         Json **next = &value->child;
         if (peek(p) != close) {
             for (;;) {
@@ -198,6 +202,7 @@ static Json *read_value(Parser *p, uint depth) {
                 p->pos++;
             }
         }
+        *next = 0;
         expect(p, close);
     } else if (first == '-' || digit(first)) {
         value->kind = JNUMBER;
@@ -226,8 +231,8 @@ static Str as_string(const Json *value) {
 }
 
 static long as_integer(const Json *value) {
+    if (value->kind != JNUMBER || value->text.n > 10) fail();
     Str str = value->text;
-    if (value->kind != JNUMBER || str.n > 10) fail();
     int negative = at(str, 0) == '-';
     str = tail(str, negative);
     for (size i = 0; i < str.n; i++) if (!digit(str.p[i])) fail();
@@ -298,17 +303,18 @@ static Str directory(Str path) {
 static Str normalize_lines(Str text) {
     size i = find_char(text, 0, '\r');
     if (i == NPOS) return text;
-    Buf out = {0};
-    room(&out, text.n);
-    size from = 0;
+    // The file owns this slice of the writable JSON input.
+    char *data = (char *)text.p;
+    size end = i;
     do {
-        append(&out, slice(text, from, i));
-        put(&out, '\n');
-        from = i + 1 + (at(text, i + 1) == '\n');
+        data[end++] = '\n';
+        size from = i + 1 + (at(text, i + 1) == '\n');
         i = find_char(text, from, '\r');
+        size next = i == NPOS ? text.n : i;
+        if (data + end != text.p + from) copy(data + end, text.p + from, next - from);
+        end += next - from;
     } while (i != NPOS);
-    append(&out, tail(text, from));
-    return take(&out);
+    return (Str){data, end};
 }
 
 static Str read_title(Str raw, Str *value) {
@@ -844,7 +850,8 @@ static void build_site(Buf *out, const Json *input) {
     size i = 0;
     for (const Json *entry = input_files->child; entry; entry = entry->next, i++) {
         const Json *content = field(entry, S("content"));
-        data[i] = (File){as_string(field(entry, S("path"))), as_string(content), content->has_cr};
+        Str text = as_string(content);
+        data[i] = (File){as_string(field(entry, S("path"))), text, content->has_cr};
         files[i] = &data[i];
     }
     sort((void **)files, n, file_order);

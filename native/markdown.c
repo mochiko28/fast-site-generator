@@ -401,8 +401,7 @@ struct Heading {
 Markdown markdown(Str body, ResolveLink resolve, void *context) {
     Lines lines = {.body = body, .end = NPOS, .preceding_gap = 1};
     Markdown result = {.excerpt = {.kind = RENDERED}};
-    Buf html = {0};
-    if (body.n) room(&html, body.n * 2 + 256);
+    Buf html = start_html();
     Entry local_ids[8] = {0};
     Map ids = {.entries = local_ids, .cap = COUNT(local_ids)};
     Heading *toc = 0, **next = &toc;
@@ -475,6 +474,7 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
     for (size i = 0; toc; i++, toc = toc->next) items[i] = &toc->item;
     result.minutes = lines.words ? (lines.words + 199) / 200 : 1;
     result.toc = array(items, count);
+    finish_html(&html);
     result.html = rendered(take(&html));
     return result;
 }

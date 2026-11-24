@@ -22,7 +22,7 @@ The addon reads both directory overrides from the initial environment and reads 
 
 The first native pass indexed line breaks and counted words in one pass. It copied ordinary inline runs while scanning for marks and emitted JSON-escaped HTML for replacements. Templates compiled record properties to numeric IDs and reused included output when their referenced bindings permitted it. Known map sizes are reserved up front, larger tag lists deduplicate by hash, and each base slug remembers the next suffix to try.
 
-The arena reserves 384 MiB of virtual address space with 128 MiB available for the final JSON. Scratch allocations are reused between cases. Templates write into the final JSON buffer. The first native pass published through a sibling temporary file and rename. Both native passes finish the answer buffer before opening the output and handle interrupted and short writes.
+The first two native passes reserved 384 MiB of virtual address space with 128 MiB available for the final JSON. Scratch allocations were reused between cases. Templates wrote into the final JSON buffer. The first native pass published through a sibling temporary file and rename. Both passes finished the answer buffer before opening the output and handled interrupted and short writes.
 
 ### Verification
 
@@ -71,7 +71,7 @@ Build with `native/build.sh -DSITE_PROFILE` to print phase times on stderr. The 
 | Minor faults during native processing | 12 | 11 |
 | Major faults during native processing | 0 | 0 |
 
-Each row is the median of 21 interleaved runs. Markdown remained the largest phase, and native CPU time was above the 8 ms target. Prefaulting 8 MiB of each arena region with `MADV_POPULATE_WRITE` measured 24.867 ms and 11 minor faults. The production arena remains lazy.
+Each row is the median of 21 interleaved runs. Markdown remained the largest phase, and native CPU time was above the 8 ms target. Prefaulting 8 MiB of each arena region with `MADV_POPULATE_WRITE` measured 24.867 ms and 11 minor faults. That build kept its arena lazy.
 
 In a separate 21-run startup comparison, process CPU measured at addon entry was 76.184 ms with the original driver, 70.836 ms with the two-line `require` driver, and 70.556 ms with the two-line `process.dlopen` driver. The control measured 72.191 ms at its first statement. The entry uses `require`.
 
@@ -131,3 +131,50 @@ Rows are medians of individual phases. The total is the median of complete runs.
 The direct 1 MiB chunked trial measured 1.192 ms in write and 11.897 ms total. One full-buffer write measured 1.110 ms in write and remains the default. Short writes and interruptions retry with the remaining bytes.
 
 Separate instrumentation on the baseline measured 0.939 ms for fused line indexing and word counts, 1.048 ms for the remaining block work, 3.130 ms for inline parsing and plain-text copies, 0.750 ms for instrumented escapes, 0.563 ms for link resolution, 0.152 ms for heading IDs, and 0.009 ms for excerpt capture. The added per-span probes increase the detailed run's CPU time.
+
+### Native memory pass
+
+- The input length determines the initial writable sizes for the input and scratch arena, rendered Markdown, and final JSON. The writable ranges can grow in place within a 646 MiB address reservation. The practice input starts with 6 MiB for input and scratch, 4 MiB for Markdown, and 10 MiB for final JSON. The environment and the two paths usually share one 4 KiB page.
+- Rendered Markdown is packed back to back. Heading labels and excerpts keep slices across growth. Both the general and Markdown arenas rewind after each case, and merge sort releases its temporary storage immediately. Carriage-return normalization compacts the file's input bytes in place.
+- The input uses one content read on the usual path, followed by the EOF check. `MAP_POPULATE` covers only the input prefix in complete 2 MiB regions. Those pages will all be written by the read. The remaining mappings use lazy paging. Each case renders directly into the final JSON buffer, which is written once on the usual path after the batch completes.
+
+The I/O trial on `e5f5707` used 19 interleaved practice runs per variant with THP disabled. Linux included the prefaulted pages in the minor-fault counts. The populated read was faster than private file mapping even with file population. The per-case output trial reused the buffer by staging writes in a sibling file. With THP enabled, it took 12.549 ms of native CPU versus 11.884 ms for the single-write baseline.
+
+| I/O trial, THP disabled | Native minor faults | Native CPU ms |
+| --- | ---: | ---: |
+| HEAD, lazy input and one output write | 3,688 | 14.676 |
+| Lazy read into a separate mapping | 3,687 | 14.400 |
+| Populated read into a separate mapping | 3,687 | 14.050 |
+| Lazy private file mapping | 3,718 | 14.431 |
+| Populated private file mapping | 3,687 | 14.349 |
+| Populated output prefix, one write | 3,688 | 13.728 |
+| Per-case writes to a sibling file | 2,631 | 14.498 |
+| Populated read and output prefix, per-case writes | 2,634 | 13.710 |
+
+GCC's LTO stack report shows a largest individual frame of 3,440 bytes in `parse_template`. The addon entry frame is 544 bytes and the Markdown frame is 848 bytes. The test with an 80,000-byte environment value also covered writable-range growth and a page-aligned input EOF. It matched the JS driver on all 4,894,554 answer bytes with no fallback.
+
+| Final verification | Output |
+| --- | --- |
+| Original SHA-256 fuzz seeds | 315 byte-identical sites from 105 seeds, 0 JS fallbacks |
+| New SHA-256 fuzz seeds | 300 byte-identical sites from 100 seeds, 0 JS fallbacks |
+| `test.sh`, `test2.sh`, `test3.sh` | 9, 16, and 8 `OK` lines |
+| `cases4` and `cases5` | 20 `OK` lines |
+| All five fixture groups with THP disabled | 53 `OK` lines, 0 JS fallbacks |
+| Forced JS fallback | Replaced a 12,000,000-byte file with the exact 7,446,432-byte practice answer |
+| Additional synthetic inputs | 200 byte-identical sites across both encoding modes. An unsupported batch preserved the existing output until the fallback wrote the exact answer. |
+| ELF | No undefined dynamic symbols, `DT_NEEDED` entries, or symbol versions. GNU property reports `x86-64-baseline`. |
+
+The practice comparison used 41 interleaved runs per build and mode on CPU 7, reusing the output path. The `nothp` wrapper sets `PR_SET_THP_DISABLE` before exec. `/proc/self/status` reported `THP_enabled: 0` through the wrapper and `THP_enabled: 1` in the normal launch. Native columns use separate `SITE_PROFILE` builds with process minor-fault deltas from `getrusage(RUSAGE_SELF)` and thread CPU time. Whole-process columns use the uninstrumented binaries and `wait4` user plus system CPU.
+
+| Entry | Mode | Native minor faults | Native CPU ms | Whole-process minor faults | Whole-process CPU ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `e5f5707` | Normal | 11 | 12.038 | 6,720 | 50.567 |
+| Final | Normal | 11 | 11.394 | 6,712 | 50.677 |
+| Kit null | Normal | — | — | 7,014 | 45.254 |
+| `e5f5707` | THP disabled | 3,688 | 15.027 | 11,985 | 54.705 |
+| Final | THP disabled | 3,282 | 13.720 | 11,569 | 53.856 |
+| Kit null | THP disabled | — | — | 8,589 | 45.892 |
+
+With THP disabled, the final native run incurred 406 fewer minor faults and used 1.307 ms less CPU. Its total process CPU was 7.964 ms above the kit null median. With THP enabled, the native median improved by 0.644 ms and the whole-process medians were within 0.110 ms. The gVisor score remains unmeasured.
+
+The wrapper source and binary, runner, baseline copy, profiled builds, and logs are in `/work/.tmp/t15`.

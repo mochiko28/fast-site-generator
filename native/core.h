@@ -39,6 +39,8 @@ static inline void put(Buf *buf, char c) {
     *room(buf, 1) = c;
     buf->n++;
 }
+Buf start_html(void);
+void finish_html(const Buf *out);
 Str take(const Buf *buf);
 Str join(size count, const Str *parts);
 #define JOIN(...) join(COUNT(((Str[]){__VA_ARGS__})), (Str[]){__VA_ARGS__})
