@@ -234,3 +234,88 @@ The practice comparison used 41 interleaved runs per entry, build, and mode on C
 With THP disabled, native minor faults fell by 2,166 (66%) and whole-process minor faults fell by 2,174. The process CPU median fell by 2.518 ms. The final process is 816 minor faults and 5.956 ms above the kit null median in this mode. Timings are local.
 
 The runner, trial builds, fixture and fuzz logs, fallback probes, and raw measurements are in `/work/.tmp/t16`. The final benchmark log is `final-41.log`.
+
+### Weighted native fault pass (t18)
+
+- The encoding prepass reads `cases.json` backwards in blocks of up to 256 KiB, with five bytes of overlap for escapes at block boundaries. The parser reads forward in 128 KiB refills and reuses the first block from the prepass in Latin-1 mode. In UTF-16 mode each refill validates its raw UTF-8 with up to three bytes of lookahead. The parser keeps the current case because decoded strings borrow its input bytes. After rendering, it compacts the unread suffix into the same window. `cases.json` contains all site inputs.
+- The scratch arena rewinds between cases. Quotes, continued list items, and trimmed paragraphs reuse one Markdown text buffer. Link cache keys that borrow that buffer are copied before reuse. Short resolved paths use stack storage. Page, tag, and heading records expose their contiguous value arrays directly and hash tables grow at 75% occupancy.
+- One demand-paged mapping supplies the arenas. The answer buffer grew to 256 KiB. The direct writer takes the lock before checking the regular file's type, link count, and length, with a blocking retry for contended regular files. The symlink and hardlink paths still stage through a sibling file.
+- The generated Unicode slug tables use packed entries, and their lookup runs only for non-ASCII characters. Inline literals removed the dynamic relocations. The build omits unwind tables and disables GCC's interprocedural constant-propagation cloning. Markdown's AVX2 scan checks CPUID and XCR0 before use. It processes complete 32-byte vectors and shares the word-count semantics of the SSE2 path, which also handles the tail.
+
+Each comparison below used 41 interleaved practice runs through `/work/.tmp/t15/nothp`. The paired delta is the median of the trial minus reference weighted costs within each round. Absolute timings varied between trial groups.
+
+| Trial | Reference faults | Trial faults | Reference weighted ms | Trial weighted ms | Paired delta ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128 KiB refills and 256 KiB encoding scan vs HEAD | 1,116 | 727 | 15.158 | 14.242 | −0.958 |
+| Compact page records, Markdown reuse, short paths, and denser maps | 727 | 613 | 16.992 | 16.624 | −0.450 |
+| Packed Unicode, inline literals, and smaller unwind metadata | 613 | 612 | 17.475 | 17.361 | −0.100 |
+| One mapping, one output status check, and 256 KiB output | 612 | 660 | 16.897 | 16.090 | −0.495 |
+| Contiguous value arrays for page, tag, and heading records | 659 | 644 | 16.694 | 16.414 | −0.355 |
+| Disable interprocedural constant-propagation cloning | 644 | 643 | 16.121 | 16.131 | −0.078 |
+| Optional AVX2 Markdown scan | 644 | 644 | 15.520 | 15.263 | −0.197 |
+
+Resident pages are 4 KiB pages measured with `mincore` after the practice run through `nothp`. HEAD's input and scratch share a mapping boundary page, counted with input.
+
+| Build | Input | Case scratch | Markdown text | Markdown HTML | Answer | Environment and paths | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD | 720 | 348 | 0 | 26 | 16 | 1 | 1,111 |
+| Input trial | 328 | 349 | 0 | 26 | 16 | 1 | 720 |
+| Scratch trial | 328 | 235 | 1 | 26 | 16 | 1 | 607 |
+| Final | 328 | 219 | 1 | 26 | 64 | 1 | 639 |
+
+| Production ELF section | HEAD bytes | Final bytes |
+| --- | ---: | ---: |
+| `.text` | 96,375 | 90,773 |
+| `.rodata` | 24,924 | 16,048 |
+| `.data` | 0 | 0 |
+| `.data.rel.ro` | 2,352 | 0 |
+| `.bss` | 4,360 | 264 |
+| `.rela.dyn` | 576 | 0 |
+| `.eh_frame` and `.eh_frame_hdr` | 4,588 | 0 |
+| Complete file | 136,368 | 115,592 |
+
+A separate 41-run interleaved `/proc/self/pagemap` probe immediately before addon registration measured a median of 10 present file-backed ELF pages at HEAD and 6 in the final build, in both modes. The read-only load segment went from eight mapped pages to four, and executable pages went from 24 to 23. `readelf` found zero relocations, undefined dynamic symbols, dependencies, and symbol versions in the final build. The GNU property records AVX2-class ISA use without declaring it required.
+
+The sandbox lacks `strace` and rejects `ptrace` with `EPERM`. The syscall counts come from counting at each raw syscall instruction site in separate builds. They exclude profiling and reporting calls and agree in both launch modes. The output path is reused for the practice benchmark.
+
+| Native syscall | HEAD | Final |
+| --- | ---: | ---: |
+| `read` | 4 | 2 |
+| `pread64` | 0 | 35 |
+| `write` | 114 | 29 |
+| `open` | 3 | 3 |
+| `close` | 3 | 3 |
+| `fstat` | 3 | 2 |
+| `mmap` | 2 | 1 |
+| `mprotect` | 4 | 0 |
+| `flock` | 1 | 1 |
+| `exit_group` | 1 | 1 |
+| **Total** | **135** | **77** |
+
+The final practice benchmark used 41 interleaved runs per entry, build, and mode on CPU 7. Native CPU and faults came from `SITE_PROFILE`. Process metrics came from `wait4` on production binaries. Weighted cost uses the CPU of the row's mode plus 0.003 ms per `nothp` native minor fault and 0.005 ms per native syscall. These are local measurements.
+
+| Entry | Mode | Native minor faults | Native CPU ms | Native syscalls | Weighted ms | Process minor faults | Process CPU ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD `b50ee87` | Normal | 24 | 12.354 | 135 | 16.377 | 6,738 | 56.208 |
+| Final | Normal | 7 | 12.411 | 77 | 14.725 | 6,713 | 57.444 |
+| Kit null | Normal | 0 | 0 | 0 | 0 | 7,024 | 53.164 |
+| HEAD `b50ee87` | `nothp` | 1,116 | 12.628 | 135 | 16.651 | 9,417 | 59.432 |
+| Final | `nothp` | 643 | 12.233 | 77 | 14.547 | 8,935 | 58.334 |
+| Kit null | `nothp` | 0 | 0 | 0 | 0 | 8,594 | 54.439 |
+
+Under `nothp`, weighted cost fell 2.104 ms (12.6%), native minor faults fell by 473, and process CPU fell 1.098 ms. Normal-mode process CPU rose 1.236 ms.
+
+| Verification | Output |
+| --- | --- |
+| SHA-256 seeds 0–104 | 315 byte-identical sites each with automatic dispatch, forced SSE2, and forced AVX2. Zero JS fallbacks. |
+| SHA-256 seeds 105–204 | 300 byte-identical sites each with automatic dispatch, forced SSE2, and forced AVX2. Zero JS fallbacks. |
+| SHA-256 seeds 0–34 through `nothp` | 105 byte-identical sites, zero JS fallbacks |
+| `test.sh`, `test2.sh`, `test3.sh` | 9, 16, and 8 `OK` lines |
+| `cases4` and `cases5` | 20 `OK` lines |
+| Forced early fallback in both modes | 0 native bytes written. JS replaced the existing file with 7,391,492 exact bytes. |
+| Forced late fallback in both modes | 1,310,720 exact native bytes. JS rewrote the complete 7,362,887-byte answer. |
+| Output publication | Exact 7,446,432-byte overwrite and truncate, staging for symlinks and hardlinks, staging cleanup on failure, and successful retry behind a held writer lock |
+| Input boundaries under `nothp` | 120 refill and encoding-overlap checks, oversized whitespace, large UTF-16 cases, and an empty batch matched JS with zero fallbacks. |
+| SIMD boundaries under `nothp` | 352 Markdown files with Unicode spaces across vector boundaries, byte-identical in automatic, forced SSE2, and forced AVX2 modes |
+
+The measurements and verification outputs are in `/work/.tmp/t18/logs`. `final-41.json` contains the individual benchmark runs.

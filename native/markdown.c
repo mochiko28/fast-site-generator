@@ -234,7 +234,7 @@ typedef struct {
     Str body, line;
     size at, end, next;
     size words;
-    uint breaks, preceding_gap, carry;
+    uint breaks, width, preceding_gap, carry;
 } Lines;
 
 // Count word starts from the two bytes of a SIMD mask on baseline x86-64.
@@ -250,16 +250,57 @@ static uint bit_count(uint bits) {
     return popcounts[bits & 255] + popcounts[bits >> 8];
 }
 
+typedef char Wide __attribute__((vector_size(32), aligned(1), may_alias));
+#define SPLAT_WIDE(c) ((Wide){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c})
+
+static __attribute__((target("avx2,popcnt"), noinline)) void scan_wide(Lines *lines) {
+    Str body = lines->body;
+    size i = lines->next;
+    for (; body.n - i >= 32; i += 32) {
+        Wide w = *(const Wide *)(body.p + i);
+        uint breaks = __builtin_ia32_pmovmskb256(w == SPLAT_WIDE('\n'));
+        if (body.n > 400) {
+            Wide ws = (w == SPLAT_WIDE(' ')) | ((w > SPLAT_WIDE(8)) & (w < SPLAT_WIDE(14)));
+            // Keep enough high bits for whitespace that crosses into the next vector.
+            size gaps = lines->carry | (uint)__builtin_ia32_pmovmskb256(ws);
+            if (__builtin_ia32_pmovmskb256(w)) {
+                uint leads = __builtin_ia32_pmovmskb256(
+                    (w == SPLAT_WIDE((char)0xc2)) | (w == SPLAT_WIDE((char)0xe1)) |
+                    (w == SPLAT_WIDE((char)0xe2)) | (w == SPLAT_WIDE((char)0xe3)) |
+                    (w == SPLAT_WIDE((char)0xef)));
+                for (; leads; leads &= leads - 1) {
+                    uint j = first_bit(leads);
+                    size width = space_width(body, i + j);
+                    gaps |= ((1UL << width) - 1) << j;
+                }
+            }
+            lines->words += __builtin_popcount((uint)(~gaps & ((gaps << 1) | lines->preceding_gap)));
+            lines->preceding_gap = (gaps >> 31) & 1;
+            lines->carry = gaps >> 32;
+        }
+        if (breaks) {
+            lines->breaks = breaks;
+            i += 32;
+            break;
+        }
+    }
+    lines->next = i;
+    lines->width = 32;
+}
+
 // A vector may contain several lines. Keep its remaining breaks for advance()
 // and count word starts when loading the vector.
 static size scan_line_end(Lines *lines) {
     Str body = lines->body;
+    if (!lines->breaks && has_avx2 && lines->next < body.n && body.n - lines->next >= 32)
+        scan_wide(lines);
     while (!lines->breaks) {
         size i = lines->next;
         if (i >= body.n) return body.n;
         Vec w = *(const Vec *)(body.p + i);
         uint valid = body.n - i >= 16 ? 0xffff : (1u << (body.n - i)) - 1;
         lines->next += 16;
+        lines->width = 16;
         lines->breaks = __builtin_ia32_pmovmskb128(w == SPLAT('\n')) & valid;
         if (body.n > 400) {
             Vec ws = (w == SPLAT(' ')) | ((w > SPLAT(8)) & (w < SPLAT(14)));
@@ -280,7 +321,7 @@ static size scan_line_end(Lines *lines) {
             lines->carry = gaps >> 16;
         }
     }
-    size end = lines->next - 16 + first_bit(lines->breaks);
+    size end = lines->next - lines->width + first_bit(lines->breaks);
     lines->breaks &= lines->breaks - 1;
     return end;
 }
@@ -321,19 +362,19 @@ static void code_block(Buf *html, Lines *lines) {
 }
 
 static void quote_block(Buf *html, Lines *lines, ResolveLink resolve, void *context) {
-    Buf content = {0};
+    Buf *content = start_markdown_text();
     do {
         Str trimmed = trim_line(tail(lines->line, 1));
         if (trimmed.n) {
-            if (content.n) put(&content, '\n');
-            append(&content, trimmed);
+            if (content->n) put(content, '\n');
+            append(content, trimmed);
         }
         advance(lines);
     } while (at(lines->line, 0) == '>');
     ADD(html, "<blockquote>\\n");
-    if (content.n) {
+    if (content->n) {
         ADD(html, "<p>");
-        inline_html(html, take(&content), resolve, context, 0);
+        inline_html(html, take(content), resolve, context, 0);
         ADD(html, "</p>\\n");
     }
     ADD(html, "</blockquote>\\n");
@@ -353,14 +394,14 @@ static void list_block(Buf *html, Lines *lines, size marker, ResolveLink resolve
         Str item = trim_line(tail(lines->line, marker));
         advance(lines);
         if (continued(lines->line)) {
-            Buf merged = {0};
-            append(&merged, item);
+            Buf *merged = start_markdown_text();
+            append(merged, item);
             do {
-                put(&merged, '\n');
-                append(&merged, trim_line(lines->line));
+                put(merged, '\n');
+                append(merged, trim_line(lines->line));
                 advance(lines);
             } while (continued(lines->line));
-            item = take(&merged);
+            item = take(merged);
         }
         ADD(html, "<li>");
         inline_html(html, item, resolve, context, 0);
@@ -373,12 +414,12 @@ static void list_block(Buf *html, Lines *lines, size marker, ResolveLink resolve
 
 static Str paragraph(Lines *lines, int *kind) {
     size from = lines->at, to;
-    Buf text = {0};
+    Buf *text = start_markdown_text();
     do {
         Str line = lines->line;
         if (indent(at(line, 0)) || indent(at(line, line.n - 1))) {
-            append(&text, slice(lines->body, from, lines->at));
-            append(&text, trim_line(line));
+            append(text, slice(lines->body, from, lines->at));
+            append(text, trim_line(line));
             from = lines->end;
         }
         to = lines->end;
@@ -386,16 +427,15 @@ static Str paragraph(Lines *lines, int *kind) {
         *kind = block(lines->line);
     } while (*kind == PARAGRAPH);
     Str last = slice(lines->body, from, to);
-    if (!text.n) return last;
-    append(&text, last);
-    return take(&text);
+    if (!text->n) return last;
+    append(text, last);
+    return take(text);
 }
 
 typedef struct Heading Heading;
 struct Heading {
     Heading *next;
-    Value item, level, id, html;
-    const Value *fields[3];
+    Value item, fields[3];
 };
 
 Markdown markdown(Str body, ResolveLink resolve, void *context) {
@@ -433,13 +473,10 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
             if (kind == 2 || kind == 3) {
                 Heading *heading = NEW(Heading, 1);
                 heading->next = 0;
-                heading->level = numeric(kind);
-                heading->id = string(id);
-                heading->html = rendered(tail(take(&html), from));
-                heading->fields[0] = &heading->level;
-                heading->fields[1] = &heading->id;
-                heading->fields[2] = &heading->html;
-                heading->item = record(HEADING_FIELDS, heading->fields, COUNT(heading->fields));
+                heading->fields[0] = numeric(kind);
+                heading->fields[1] = string(id);
+                heading->fields[2] = rendered(tail(take(&html), from));
+                heading->item = record_values(HEADING_FIELDS, heading->fields, COUNT(heading->fields));
                 *next = heading;
                 next = &heading->next;
                 count++;

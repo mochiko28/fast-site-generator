@@ -14,16 +14,65 @@ struct Json {
     int has_cr;
 };
 
-typedef struct { Str source; size pos; } Parser;
+#define INPUT_CHUNK (128UL << 10)
+#define SCAN_CHUNK (256UL << 10)
+
+typedef struct {
+    Str source;
+    size pos, loaded, remaining;
+    size utf8_overlap;  // Leading bytes validated by the previous refill.
+} Parser;
 typedef char Vec __attribute__((vector_size(16), aligned(1), may_alias));
 #define SPLAT(c) ((Vec){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c})
 
 static int json_space(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
 
+static __attribute__((noinline)) int refill(Parser *p, size i) {
+    while (i >= p->source.n && p->remaining) {
+        size n = p->remaining < INPUT_CHUNK ? p->remaining : INPUT_CHUNK;
+        PHASE_BEGIN(previous, INPUT);
+        char *bytes = (char *)p->source.p + p->source.n;
+        size following = p->remaining - n;
+        size lookahead = latin1 ? 0 : (following < 3 ? following : 3);
+        read_input(bytes, n + lookahead, p->loaded);
+        if (!latin1) {
+            // Finish any code point that starts in this block with the lookahead.
+            size end = n;
+            while (end < n + lookahead && ((byte)bytes[end] & 0xc0) == 0x80) end++;
+            validate_utf8((Str){bytes + p->utf8_overlap, end - p->utf8_overlap});
+            p->utf8_overlap = end - n;
+        }
+        PHASE_END(previous);
+        p->source.n += n;
+        p->loaded += n;
+        p->remaining -= n;
+    }
+    return i < p->source.n;
+}
+
+static inline int parser_at(Parser *p, size i) {
+    if (i >= p->source.n && !refill(p, i)) return -1;
+    return (byte)p->source.p[i];
+}
+
 static int peek(Parser *p) {
     int c;
-    while (json_space(c = at(p->source, p->pos))) p->pos++;
+    while (json_space(c = parser_at(p, p->pos))) p->pos++;
     return c;
+}
+
+// Between cases no parsed string refers to the input. Discard completely
+// consumed blocks so runs of inter-case whitespace do not grow the window.
+static int peek_batch(Parser *p) {
+    for (;;) {
+        while (p->pos < p->source.n) {
+            int c = (byte)p->source.p[p->pos];
+            if (!json_space(c)) return c;
+            p->pos++;
+        }
+        p->pos = p->source.n = 0;
+        if (!refill(p, 0)) return -1;
+    }
 }
 
 static void expect(Parser *p, int c) {
@@ -88,6 +137,10 @@ static Str read_string(Parser *p, int *has_cr) {
     Str input = p->source;
     size from = p->pos;
     size end = json_mark(input, from);
+    while (end == input.n && refill(p, end)) {
+        input = p->source;
+        end = json_mark(input, end);
+    }
     if (at(input, end) == '"') {
         p->pos = end + 1;
         return slice(input, from, end);
@@ -97,7 +150,8 @@ static Str read_string(Parser *p, int *has_cr) {
     char *write = (char *)input.p + end;
     for (;;) {
         if (at(input, end) != '\\') fail();
-        unsigned c = at(input, end + 1);
+        unsigned c = parser_at(p, end + 1);
+        input = p->source;
         from = end + 2;
         byte decoded = c < COUNT(unescape) ? unescape[c] : 0;
         if (decoded) {
@@ -105,6 +159,10 @@ static Str read_string(Parser *p, int *has_cr) {
             if (decoded == '\r' && has_cr) *has_cr = 1;
         } else {
             if (c != 'u') fail();
+            if (end + 11 >= input.n) {
+                refill(p, end + 11);
+                input = p->source;
+            }
             int cp = hex4(input, from);
             if (cp < 0) fail();
             if (has_cr && cp == '\r') *has_cr = 1;
@@ -121,6 +179,10 @@ static Str read_string(Parser *p, int *has_cr) {
             write += encoded.n;
         }
         for (;;) {
+            if (from >= input.n) {
+                if (!refill(p, from)) fail();
+                input = p->source;
+            }
             // The input arena has a readable SIMD tail.
             Vec bytes = *(const Vec *)(input.p + from);
             uint hits = string_marks(bytes);
@@ -132,7 +194,9 @@ static Str read_string(Parser *p, int *has_cr) {
                 else copy(write, input.p + from, n);
                 write += n;
                 end = from + n;
-                break;
+                if (end < input.n) break;
+                from = end;
+                continue;
             }
             *(Vec *)write = bytes;
             write += 16;
@@ -145,28 +209,27 @@ static Str read_string(Parser *p, int *has_cr) {
 }
 
 static Str read_number(Parser *p) {
-    Str input = p->source;
     size i = p->pos;
-    if (at(input, i) == '-') i++;
-    if (at(input, i) == '0') {
+    if (parser_at(p, i) == '-') i++;
+    if (parser_at(p, i) == '0') {
         i++;
     } else {
-        if (!digit(at(input, i))) fail();
-        do i++; while (digit(at(input, i)));
+        if (!digit(parser_at(p, i))) fail();
+        do i++; while (digit(parser_at(p, i)));
     }
-    if (at(input, i) == '.') {
+    if (parser_at(p, i) == '.') {
         i++;
-        if (!digit(at(input, i))) fail();
-        do i++; while (digit(at(input, i)));
+        if (!digit(parser_at(p, i))) fail();
+        do i++; while (digit(parser_at(p, i)));
     }
-    int c = at(input, i);
+    int c = parser_at(p, i);
     if (c == 'e' || c == 'E') {
-        c = at(input, ++i);
+        c = parser_at(p, ++i);
         if (c == '+' || c == '-') i++;
-        if (!digit(at(input, i))) fail();
-        do i++; while (digit(at(input, i)));
+        if (!digit(parser_at(p, i))) fail();
+        do i++; while (digit(parser_at(p, i)));
     }
-    Str result = slice(input, p->pos, i);
+    Str result = slice(p->source, p->pos, i);
     p->pos = i;
     return result;
 }
@@ -209,7 +272,9 @@ static Json *read_value(Parser *p, uint depth) {
         value->text = read_number(p);
     } else {
         Str token = first == 't' ? S("true") : first == 'f' ? S("false") : S("null");
-        if (!starts(tail(p->source, p->pos), token)) fail();
+        size end = p->pos + token.n - 1;
+        if ((end >= p->source.n && !refill(p, end)) ||
+            !starts(tail(p->source, p->pos), token)) fail();
         value->kind = first == 'n' ? JNULL : JBOOLEAN;
         p->pos += token.n;
     }
@@ -251,23 +316,28 @@ typedef struct {
     int draft;
 } Front;
 
+enum PageField {
+    P_TITLE, P_URL, P_DATE, P_DATE_LONG, P_SUMMARY, P_EXCERPT, P_MINUTES, P_TAGS,
+    P_SLUG, P_CONTENT, P_TOC, P_NEWER, P_OLDER, P_IS_POST, P_FIELDS
+};
+
 typedef struct Page Page;
 typedef struct TagEntry TagEntry;
 struct Page {
-    Str path, directory, output, url, slug;
-    Front front;
+    Str path, directory, output, body;
+    Str *tag_names;
+    size tag_count;
     const Template *layout;
     int post;
     Value card, link, data;
-    const Value *fields[14];
-    Value values[14];
+    Value values[P_FIELDS];
 };
 
+enum TagField { T_NAME, T_SLUG, T_URL, T_COUNT, T_POSTS, T_FIELDS };
 struct TagEntry {
     Str slug;
-    Value name, slug_value, url, count, posts;
+    Value values[T_FIELDS];
     Value reference, metadata, listing;
-    const Value *fields[5];
     const Value **cards;
     size n, cap;
 };
@@ -355,13 +425,19 @@ static int valid_date(Str s) {
     return d <= (size)days[m - 1] + (m == 2 && y % 4 == 0);
 }
 
+typedef struct { char text[10]; byte length; } ShortLiteral;
+#define SHORT(literal) {literal, sizeof(literal) - 1}
+
 static Str long_date(Str s) {
-    static const Str months[] = {
-        S("January"), S("February"), S("March"), S("April"), S("May"), S("June"),
-        S("July"), S("August"), S("September"), S("October"), S("November"), S("December")
+    static const ShortLiteral months[] = {
+        SHORT("January"), SHORT("February"), SHORT("March"), SHORT("April"), SHORT("May"), SHORT("June"),
+        SHORT("July"), SHORT("August"), SHORT("September"), SHORT("October"), SHORT("November"), SHORT("December")
     };
     if (!s.n) return s;
-    return JOIN(number(decimal(tail(s, 8))), S(" "), months[decimal(slice(s, 5, 7)) - 1], S(" "), slice(s, 0, 4));
+    const ShortLiteral *month = &months[decimal(slice(s, 5, 7)) - 1];
+    char day[20];
+    return JOIN(format_number(day + sizeof(day), decimal(tail(s, 8))), S(" "),
+                ((Str){month->text, month->length}), S(" "), slice(s, 0, 4));
 }
 
 static Str read_tags(Str raw, Front *front) {
@@ -387,7 +463,10 @@ static Str read_tags(Str raw, Front *front) {
 }
 
 enum FrontKey { TITLE, DATE, TAGS, DRAFT, LAYOUT, SLUG, SUMMARY };
-static const Str keys[] = {S("title"), S("date"), S("tags"), S("draft"), S("layout"), S("slug"), S("summary")};
+static const ShortLiteral keys[] = {
+    SHORT("title"), SHORT("date"), SHORT("tags"), SHORT("draft"), SHORT("layout"), SHORT("slug"), SHORT("summary")
+};
+#undef SHORT
 
 static Str key_value(Front *front, enum FrontKey key, Str raw) {
     switch (key) {
@@ -427,7 +506,7 @@ static Str parse_front_line(Front *front, Str line, size number_line, uint *seen
         return JOIN(S("line "), number(number_line), S(" is not \"key: value\""));
     Str key = slice(line, 0, colon);
     size k = 0;
-    while (k < COUNT(keys) && !equal(key, keys[k])) k++;
+    while (k < COUNT(keys) && !equal(key, (Str){keys[k].text, keys[k].length})) k++;
     if (k == COUNT(keys)) return JOIN(S("unknown key \""), key, S("\""));
     if (*seen & (1u << k)) return JOIN(S("key \""), key, S("\" is given twice"));
     *seen |= 1u << k;
@@ -516,9 +595,16 @@ static void add_page(Site *site, Page *page, const File *file) {
     Str slug = unique_slug(used, front.slug.n ? front.slug : slugify(front.title));
     Str output_dir = slug_dir.n ? JOIN(slug_dir, S("/"), slug) : slug;
     *page = (Page){
-        .path = file->path, .directory = dir, .front = front, .post = post, .layout = t, .slug = slug,
-        .url = JOIN(site->base, S("/"), output_dir, S("/")), .output = JOIN(output_dir, S("/index.html")),
+        .path = file->path, .directory = dir, .body = front.body, .post = post, .layout = t,
+        .tag_names = front.tag_names, .tag_count = front.tag_count,
+        .output = JOIN(output_dir, S("/index.html")),
     };
+    Value *v = page->values;
+    v[P_TITLE] = string(front.title);
+    v[P_URL] = string(JOIN(site->base, S("/"), output_dir, S("/")));
+    v[P_DATE] = string(front.date);
+    v[P_SUMMARY] = string(front.summary);
+    v[P_SLUG] = string(slug);
     set(&site->sources, file->path, page);
     PHASE_END(front_phase);
 }
@@ -535,7 +621,7 @@ static int scheme(Str target) {
     return 0;
 }
 
-static Str relative_path(Str dir, Str rel) {
+static Str relative_path(Str dir, Str rel, char *storage, size capacity) {
     // Resolve canonical paths directly, dropping leading parent components.
     Str base = dir, rest = rel;
     while (starts(rest, S("../"))) {
@@ -554,7 +640,15 @@ static Str relative_path(Str dir, Str rel) {
             Str suffix = tail(rest, ++i);
             if (at(suffix, 0) == '/' || starts(suffix, S("./")) || starts(suffix, S("../"))) break;
         }
-        if (i == NPOS) return base.n ? JOIN(base, S("/"), rest) : rest;
+        if (i == NPOS) {
+            if (!base.n) return rest;
+            size bytes = base.n + 1 + rest.n;
+            char *out = bytes <= capacity ? storage : NEW(char, bytes);
+            copy(out, base.p, base.n);
+            out[base.n] = '/';
+            copy(out + base.n + 1, rest.p, rest.n);
+            return (Str){out, bytes};
+        }
     }
     Str initial[64];
     Str *parts = initial;
@@ -586,7 +680,7 @@ static Str relative_path(Str dir, Str rel) {
     if (count < 2) return count ? parts[0] : S("");
     size bytes = count - 1;
     for (size i = 0; i < count; i++) bytes += parts[i].n;
-    char *out = NEW(char, bytes);
+    char *out = bytes <= capacity ? storage : NEW(char, bytes);
     size at = 0;
     for (size i = 0; i < count; i++) {
         if (i) out[at++] = '/';
@@ -616,11 +710,12 @@ static Str link_target(void *context, Str target) {
     size hash = find_char(target, 0, '#');
     if (hash == NPOS) hash = target.n;
     Str frag = tail(target, hash);
-    Str path = relative_path(link->page->directory, slice(target, 0, hash));
+    char path_bytes[256];
+    Str path = relative_path(link->page->directory, slice(target, 0, hash), path_bytes, sizeof(path_bytes));
     Str resolved = target;
     if (path.p) {
         const Page *page = get(&site->sources, path);
-        if (page) resolved = frag.n ? JOIN(page->url, frag) : page->url;
+        if (page) resolved = frag.n ? JOIN(page->values[P_URL].text, frag) : page->values[P_URL].text;
         else if (get(&site->statics, path)) resolved = JOIN(site->base, S("/"), path, frag);
     }
     if (resolved.p == target.p) {
@@ -632,15 +727,15 @@ static Str link_target(void *context, Str target) {
     } else {
         saved = NEW(Str, 1);
         *saved = resolved;
-        set(link->resolved, target, saved);
+        set(link->resolved, retain_link_key(target), saved);
     }
     return resolved;
 }
 
 static int post_order(const void *a, const void *b) {
     const Page *x = a, *y = b;
-    int dates = compare(y->front.date, x->front.date);
-    return dates ? dates : compare(x->slug, y->slug);
+    int dates = compare(y->values[P_DATE].text, x->values[P_DATE].text);
+    return dates ? dates : compare(x->values[P_SLUG].text, y->values[P_SLUG].text);
 }
 
 static int tag_order(const void *a, const void *b) {
@@ -652,17 +747,15 @@ static int tag_order(const void *a, const void *b) {
 static TagEntry *make_tag(Site *site, Str name, Str slug, int post) {
     TagEntry *tag = NEW(TagEntry, 1);
     *tag = (TagEntry){
-        .slug = slug, .name = string(name), .slug_value = string(slug),
-        .url = string(post ? JOIN(site->base, S("/tags/"), slug, S("/")) : S("")),
+        .slug = slug,
+        .values = {
+            [T_NAME] = string(name), [T_SLUG] = string(slug),
+            [T_URL] = string(post ? JOIN(site->base, S("/tags/"), slug, S("/")) : S("")),
+        },
     };
-    tag->fields[0] = &tag->name;
-    tag->fields[1] = &tag->slug_value;
-    tag->fields[2] = &tag->url;
-    tag->fields[3] = &tag->count;
-    tag->fields[4] = &tag->posts;
-    tag->reference = record(TAG_FIELDS, tag->fields, 3);
-    tag->metadata = record(TAG_FIELDS, tag->fields, 4);
-    tag->listing = record(TAG_FIELDS, tag->fields, 5);
+    tag->reference = record_values(TAG_FIELDS, tag->values, T_COUNT);
+    tag->metadata = record_values(TAG_FIELDS, tag->values, T_POSTS);
+    tag->listing = record_values(TAG_FIELDS, tag->values, T_FIELDS);
     if (post) set(&site->tags, slug, tag);
     return tag;
 }
@@ -679,13 +772,13 @@ static void add_tag_post(TagEntry *tag, const Page *page) {
 }
 
 static Value page_tags(Site *site, Page *page) {
-    size n = page->front.tag_count;
+    size n = page->tag_count;
     const Value **items = NEW(const Value *, n);
     Str slugs[8];
     Map seen = {0};
     size count = 0;
     for (size i = 0; i < n; i++) {
-        Str name = page->front.tag_names[i];
+        Str name = page->tag_names[i];
         const Str *saved = get(&site->tag_slugs, name);
         if (!saved) {
             Str *slot = NEW(Str, 1);
@@ -711,32 +804,20 @@ static Value page_tags(Site *site, Page *page) {
     return array(items, count);
 }
 
-enum PageField {
-    P_TITLE, P_URL, P_DATE, P_DATE_LONG, P_SUMMARY, P_EXCERPT, P_MINUTES, P_TAGS,
-    P_SLUG, P_CONTENT, P_TOC, P_NEWER, P_OLDER, P_IS_POST, P_FIELDS
-};
-
 static void card(Site *site, Page *page) {
-    _Static_assert(P_FIELDS == COUNT(((Page *)0)->fields), "page fields");
     Value *v = page->values;
-    v[P_TITLE] = string(page->front.title);
-    v[P_URL] = string(page->url);
-    v[P_DATE] = string(page->front.date);
-    v[P_DATE_LONG] = string(long_date(page->front.date));
-    v[P_SUMMARY] = string(page->front.summary);
+    v[P_DATE_LONG] = string(long_date(v[P_DATE].text));
     v[P_TAGS] = page_tags(site, page);
-    v[P_SLUG] = string(page->slug);
     v[P_IS_POST] = boolean(page->post);
-    for (size i = 0; i < P_FIELDS; i++) page->fields[i] = &v[i];
-    page->link = record(PAGE_FIELDS, page->fields, P_SUMMARY);
-    page->card = record(PAGE_FIELDS, page->fields, P_SLUG);
-    page->data = record(PAGE_FIELDS, page->fields, P_FIELDS);
+    page->link = record_values(PAGE_FIELDS, v, P_SUMMARY);
+    page->card = record_values(PAGE_FIELDS, v, P_SLUG);
+    page->data = record_values(PAGE_FIELDS, v, P_FIELDS);
 }
 
 static void render_markdown(Site *site, Page *page) {
     PHASE_BEGIN(previous, MARKDOWN);
     LinkContext context = {.site = site, .page = page};
-    Markdown md = markdown(page->front.body, link_target, &context);
+    Markdown md = markdown(page->body, link_target, &context);
     Value *v = page->values;
     v[P_EXCERPT] = md.excerpt;
     v[P_MINUTES] = numeric(md.minutes);
@@ -752,8 +833,8 @@ static Value collect_tags(Site *site) {
     for (size i = 0; i < site->tags.cap; i++) {
         TagEntry *tag = site->tags.entries[i].val;
         if (!tag) continue;
-        tag->count = numeric(tag->n);
-        tag->posts = array(tag->cards, tag->n);
+        tag->values[T_COUNT] = numeric(tag->n);
+        tag->values[T_POSTS] = array(tag->cards, tag->n);
         site->tag_order[n++] = tag;
     }
     sort((void **)site->tag_order, site->tag_count, tag_order);
@@ -951,14 +1032,38 @@ static void build_site(Buf *out, const Json *input) {
     put(out, '}');
 }
 
-void build_answers(Buf *out, Str input) {
+void build_answers(Buf *out, char *source, size length) {
+    // The encoding decision belongs to the entire batch. Keep escape detection
+    // bounded to the input window, with five bytes retained between reads.
+    size first = length < INPUT_CHUNK ? length : INPUT_CHUNK;
+    size overlap = 0;
+    latin1 = 1;
+    // Read the first parser block last so it is ready to parse. Each block also
+    // sees five bytes from the block to its right for escapes across the boundary.
+    for (size end = length; end;) {
+        size base = end > first ? first + ((end - first - 1) & ~(SCAN_CHUNK - 1)) : 0;
+        size n = end - base;
+        read_input(source, n, base);
+        if (has_unicode_escape((Str){source, n + overlap})) {
+            latin1 = 0;
+            break;
+        }
+        if (base) {
+            overlap = n + overlap < 5 ? n + overlap : 5;
+            size preceding = base == first ? first : SCAN_CHUNK;
+            copy(source + preceding, source, overlap);
+        }
+        end = base;
+    }
+    // UTF-16 mode restarts at byte zero so all raw UTF-8 is validated on refill.
+    size scanned = latin1 ? first : 0;
+    Parser parser = {.source = {source, scanned}, .loaded = scanned, .remaining = length - scanned};
+
     PHASE(PARSE);
-    latin1 = !has_unicode_escape(input);
-    if (!latin1) validate_utf8(input);
-    Parser parser = {input, 0};
-    expect(&parser, '[');
+    if (peek_batch(&parser) != '[') fail();
+    parser.pos++;
     put(out, '[');
-    if (peek(&parser) != ']') {
+    if (peek_batch(&parser) != ']') {
         for (;;) {
             size mark = checkpoint();
             PHASE(PARSE);
@@ -967,12 +1072,20 @@ void build_answers(Buf *out, Str input) {
             build_site(out, field(item, S("input")));
             PHASE(PARSE);
             rewind_arena(mark);
-            if (peek(&parser) != ',') break;
+            if (peek_batch(&parser) != ',') break;
             parser.pos++;
+            // No slice from the completed case is live after the arena rewind.
+            if (length > first) {
+                size unread = parser.source.n - parser.pos;
+                copy(source, source + parser.pos, unread);
+                parser.source.n = unread;
+                parser.pos = 0;
+            }
             put(out, ',');
         }
     }
-    expect(&parser, ']');
-    if (peek(&parser) != -1) fail();
+    if (peek_batch(&parser) != ']') fail();
+    parser.pos++;
+    if (peek_batch(&parser) != -1) fail();
     put(out, ']');
 }

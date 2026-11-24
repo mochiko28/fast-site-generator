@@ -19,7 +19,7 @@ typedef struct { char *p; size n, cap; } Buf;
     add_target->n += add_length; \
 } while (0)
 
-extern int latin1;
+extern int latin1, has_avx2;
 
 _Noreturn void fail(void);
 void *alloc(size element, size count);
@@ -47,6 +47,8 @@ static inline void put(Buf *buf, char c) {
 Buf start_html(void);
 void finish_html(const Buf *out);
 size html_checkpoint(void);
+Buf *start_markdown_text(void);
+Str retain_link_key(Str text);
 Str retain_html(size mark, Str text);
 size answer_position(const Buf *out);
 Str cache_answer(const Buf *out, size start);
@@ -112,7 +114,9 @@ enum Property { PROP_UNKNOWN,
     PROP_TITLE, PROP_TOC, PROP_TOTAL, PROP_URL
 };
 enum RecordLayout {
-    PAGE_FIELDS, TAG_FIELDS, HEADING_FIELDS, LOOP_FIELDS, PAGER_FIELDS,
+    // These first three layouts use contiguous Value arrays.
+    PAGE_FIELDS, TAG_FIELDS, HEADING_FIELDS,
+    LOOP_FIELDS, PAGER_FIELDS,
     INDEX_FIELDS, SITE_FIELDS, GLOBAL_FIELDS, PAGE_ROOT, TAG_ROOT
 };
 struct Value {
@@ -121,7 +125,11 @@ struct Value {
         Str text;
         size number;
         struct { const Value **items; size n; } array;
-        struct { const Value *const *items; uint n; enum RecordLayout layout; } record;
+        struct {
+            union { const Value *const *items; const Value *values; };
+            uint n;
+            enum RecordLayout layout;
+        } record;
     };
 };
 
@@ -132,7 +140,10 @@ static inline Value array(const Value **items, size n) {
     return (Value){.kind = ARRAY, .array = {items, n}};
 }
 static inline Value record(enum RecordLayout layout, const Value *const *items, uint n) {
-    return (Value){.kind = RECORD, .record = {items, n, layout}};
+    return (Value){.kind = RECORD, .record = {.items = items, .n = n, .layout = layout}};
+}
+static inline Value record_values(enum RecordLayout layout, const Value *values, uint n) {
+    return (Value){.kind = RECORD, .record = {.values = values, .n = n, .layout = layout}};
 }
 
 enum Property property_id(Str name);
@@ -160,7 +171,8 @@ Markdown markdown(Str body, ResolveLink resolve, void *context);
 
 size checkpoint(void);
 void rewind_arena(size mark);
-void build_answers(Buf *out, Str input);
+void read_input(char *bytes, size count, size offset);
+void build_answers(Buf *out, char *source, size length);
 
 enum Phase {
     SETUP, INPUT, PARSE, FRONT, MARKDOWN, TEMPLATES, SLUGS, SERIALIZE,

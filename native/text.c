@@ -170,10 +170,16 @@ Str trim_line(Str s) {
     return slice(s, a, b);
 }
 
-static const Str entities[128] = {
-    ['&'] = S("&amp;"), ['<'] = S("&lt;"), ['>'] = S("&gt;"),
-    ['"'] = S("&quot;"), ['\''] = S("&#39;"),
-};
+static Str html_entity(int c) {
+    switch (c) {
+        case '&': return S("&amp;");
+        case '<': return S("&lt;");
+        case '>': return S("&gt;");
+        case '"': return S("&quot;");
+        case '\'': return S("&#39;");
+        default: return (Str){0};
+    }
+}
 static const char hex[] = "0123456789abcdef";
 static const byte escape_class[256] = {
     [0 ... 31] = 1, ['"'] = 1, ['\\'] = 1, ['&'] = 2, ['<'] = 2, ['>'] = 2, ['\''] = 2,
@@ -204,12 +210,23 @@ static size next_json(Str s, size i, int html, int unicode) {
         uint mask = json_marks(*(const Vec *)(s.p + i), html, unicode);
         if (mask) return i + first_bit(mask);
     }
+    if (i >= 16 && i < s.n) {
+        // The last vector overlaps earlier bytes. Mask lanes before the cursor.
+        size end = s.n - 16;
+        uint mask = json_marks(*(const Vec *)(s.p + end), html, unicode) & (0xffffu << (i - end));
+        return mask ? end + first_bit(mask) : s.n;
+    }
     if (s.n - i >= 8) {
         typedef long Word __attribute__((aligned(1), may_alias));
-        union { long words[2]; Vec bytes; } block = {.words = {*(const Word *)(s.p + i), 0}};
+        // Check the ends together. Any overlapping match appears in the first half.
+        size last = s.n - 8;
+        union { long words[2]; Vec bytes; } block = {
+            .words = {*(const Word *)(s.p + i), *(const Word *)(s.p + last)}
+        };
         uint mask = json_marks(block.bytes, html, unicode);
         if (mask & 255) return i + first_bit(mask);
-        i += 8;
+        if (mask >> 8) return last + first_bit(mask >> 8);
+        return s.n;
     }
     uint mask = 1 | (html ? 2 : 0) | (unicode == 1 ? 8 : unicode == 2 ? 4 : 0);
     for (; i < s.n && !(escape_class[(byte)s.p[i]] & mask); i++) {}
@@ -244,7 +261,7 @@ void json(Buf *out, Str s, int html, int escape_pairs) {
         size next = i + 1;
         Str entity = {0};
         if (c < 128) {
-            if (html) entity = entities[c];
+            if (html) entity = html_entity(c);
             if (!entity.n) entity = json_escape(c);
         } else {
             next = i;
@@ -290,7 +307,7 @@ void escape_rendered(Buf *out, Str s) {
             }
         }
         append(out, slice(s, from, i));
-        append(out, entities[c]);
+        append(out, html_entity(c));
         from = i = next;
     }
     append(out, tail(s, from));
@@ -302,17 +319,19 @@ static Str slug_projection(uint cp) {
     size lo = 0, hi = COUNT(slug_drops);
     while (lo < hi) {
         size mid = (lo + hi) / 2;
-        if (cp < slug_drops[mid].first) hi = mid;
-        else if (cp > slug_drops[mid].last) lo = mid + 1;
+        uint word = slug_drops[mid], first = word >> 8;
+        if (cp < first) hi = mid;
+        else if (cp - first > (word & 255)) lo = mid + 1;
         else return (Str){0};
     }
     lo = 0;
     hi = COUNT(slug_maps);
     while (lo < hi) {
         size mid = (lo + hi) / 2;
-        if (cp < slug_maps[mid].cp) hi = mid;
-        else if (cp > slug_maps[mid].cp) lo = mid + 1;
-        else return (Str){slug_data + slug_maps[mid].offset, slug_maps[mid].length};
+        uint word = slug_maps[mid], key = word >> 15;
+        if (cp < key) hi = mid;
+        else if (cp > key) lo = mid + 1;
+        else return (Str){slug_data + ((word >> 3) & 4095), word & 7};
     }
     return S("-");
 }
@@ -465,8 +484,11 @@ static const byte field_slots[][PROP_URL + 1] = {
 const Value *property(const Value *value, enum Property name) {
     if (!value || name == PROP_UNKNOWN) return 0;
     if (value->kind == RECORD) {
-        uint slot = field_slots[value->record.layout][name];
-        return slot && slot <= value->record.n ? value->record.items[slot - 1] : 0;
+        enum RecordLayout layout = value->record.layout;
+        uint slot = field_slots[layout][name];
+        if (!slot || slot > value->record.n) return 0;
+        if (layout <= HEADING_FIELDS) return &value->record.values[slot - 1];
+        return value->record.items[slot - 1];
     }
     if (value->kind == ARRAY && name == PROP_LENGTH) {
         // Template paths cannot contain a numeric segment.
