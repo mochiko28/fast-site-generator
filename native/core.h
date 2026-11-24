@@ -52,6 +52,7 @@ Str retain_link_key(Str text);
 Str retain_html(size mark, Str text);
 size answer_position(const Buf *out);
 Str cache_answer(const Buf *out, size start);
+Str answer_fragment(const Buf *out, size start, size length);
 Str take(const Buf *buf);
 Str join(size count, const Str *parts);
 #define JOIN(...) join(COUNT(((Str[]){__VA_ARGS__})), (Str[]){__VA_ARGS__})
@@ -103,7 +104,7 @@ void json_ascii(Buf *out, int c);
 Str slugify(Str s);
 Str unique_slug(Map *used, Str slug);
 
-enum ValueKind { NIL, STRING, NUMBER, BOOLEAN, ARRAY, RECORD, RENDERED };
+enum ValueKind { NIL, STRING, NUMBER, BOOLEAN, ARRAY, RECORD, RENDERED, LITERAL_STRING };
 typedef struct Value Value;
 enum Property { PROP_UNKNOWN,
     PROP_BASE_URL, PROP_CONTENT, PROP_COUNT, PROP_DATE, PROP_DATE_LONG, PROP_EXCERPT,
@@ -119,36 +120,43 @@ enum RecordLayout {
     LOOP_FIELDS, PAGER_FIELDS,
     INDEX_FIELDS, SITE_FIELDS, GLOBAL_FIELDS, PAGE_ROOT, TAG_ROOT
 };
+// Counts and text lengths come from the bounded native arenas.
 struct Value {
-    enum ValueKind kind;
     union {
-        Str text;
+        const char *bytes;
         size number;
-        struct { const Value **items; size n; } array;
-        struct {
-            union { const Value *const *items; const Value *values; };
-            uint n;
-            enum RecordLayout layout;
-        } record;
+        const Value **items;
+        const Value *const *fields;
+        const Value *values;
     };
+    union {
+        uint n;
+        struct { unsigned short fields, layout; } shape;
+    };
+    enum ValueKind kind;
 };
 
-static inline Value string(Str s) { return (Value){.kind = STRING, .text = s}; }
+_Static_assert(sizeof(Value) == 16, "compact template values");
+
+static inline Str value_text(const Value *v) { return (Str){v->bytes, v->n}; }
+static inline Value string(Str s) { return (Value){.kind = STRING, .bytes = s.p, .n = s.n}; }
+Value template_text(Str s);
+static inline Value literal_string(Str s) { return (Value){.kind = LITERAL_STRING, .bytes = s.p, .n = s.n}; }
 static inline Value numeric(size n) { return (Value){.kind = NUMBER, .number = n}; }
 static inline Value boolean(int n) { return (Value){.kind = BOOLEAN, .number = n}; }
 static inline Value array(const Value **items, size n) {
-    return (Value){.kind = ARRAY, .array = {items, n}};
+    return (Value){.kind = ARRAY, .items = items, .n = n};
 }
 static inline Value record(enum RecordLayout layout, const Value *const *items, uint n) {
-    return (Value){.kind = RECORD, .record = {.items = items, .n = n, .layout = layout}};
+    return (Value){.kind = RECORD, .fields = items, .shape = {n, layout}};
 }
 static inline Value record_values(enum RecordLayout layout, const Value *values, uint n) {
-    return (Value){.kind = RECORD, .record = {.values = values, .n = n, .layout = layout}};
+    return (Value){.kind = RECORD, .values = values, .shape = {n, layout}};
 }
 
 enum Property property_id(Str name);
 const Value *property(const Value *value, enum Property name);
-static inline Value rendered(Str escaped) { return (Value){.kind = RENDERED, .text = escaped}; }
+static inline Value rendered(Str escaped) { return (Value){.kind = RENDERED, .bytes = escaped.p, .n = escaped.n}; }
 
 typedef struct Node Node;
 typedef struct Memo Memo;
@@ -159,14 +167,14 @@ typedef struct {
     Memo *memo[9];
 } Template;
 Template parse_template(Str source);
-void prepare_template(Template *template, const Map *templates);
+void prepare_template(Template *template, const Map *templates, const Value *site);
 void render_template(Buf *out, const Template *template, const Value *root, const Value *globals);
 
 typedef struct {
     Value html, excerpt, toc;
     size minutes;
 } Markdown;
-typedef Str (*ResolveLink)(void *context, Str target);
+typedef Value (*ResolveLink)(void *context, Str target);
 Markdown markdown(Str body, ResolveLink resolve, void *context);
 
 size checkpoint(void);

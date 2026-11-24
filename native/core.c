@@ -10,7 +10,7 @@
 #ifndef SITE_OUTPUT_CAPACITY
 #define SITE_OUTPUT_CAPACITY (256UL << 10)
 #endif
-#define INCLUDE_CACHE_LIMIT (32UL << 10)
+#define INCLUDE_CACHE_LIMIT (64UL << 10)
 #define HTML_LIMIT SCRATCH_LIMIT
 #define INPUT_LIMIT SCRATCH_LIMIT
 #define MARKDOWN_TEXT_LIMIT SCRATCH_LIMIT
@@ -93,13 +93,27 @@ void copy(void *dst, const void *src, size n) {
         __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
         return;
     }
-    while (n >= 16) {
+    if (n >= 64) {
         *(Vector *)d = *(const Vector *)s;
-        d += 16;
-        s += 16;
-        n -= 16;
+        *(Vector *)(d + 16) = *(const Vector *)(s + 16);
+        *(Vector *)(d + 32) = *(const Vector *)(s + 32);
+        *(Vector *)(d + 48) = *(const Vector *)(s + 48);
+        d += 64;
+        s += 64;
+        n -= 64;
     }
-    if (n >= 8) {
+    if (n >= 32) {
+        Vector first = *(const Vector *)s, second = *(const Vector *)(s + 16);
+        Vector rear = *(const Vector *)(s + n - 32), last = *(const Vector *)(s + n - 16);
+        *(Vector *)d = first;
+        *(Vector *)(d + 16) = second;
+        *(Vector *)(d + n - 32) = rear;
+        *(Vector *)(d + n - 16) = last;
+    } else if (n >= 16) {
+        Vector first = *(const Vector *)s, last = *(const Vector *)(s + n - 16);
+        *(Vector *)d = first;
+        *(Vector *)(d + n - 16) = last;
+    } else if (n >= 8) {
         Word first = *(const Word *)s, last = *(const Word *)(s + n - 8);
         *(Word *)d = first;
         *(Word *)(d + n - 8) = last;
@@ -174,6 +188,12 @@ void append_more(Buf *buf, Str str) {
 
 size answer_position(const Buf *out) { return stream.written + out->n; }
 
+Str answer_fragment(const Buf *out, size start, size length) {
+    // The source and the new copy must both fit in the current output buffer.
+    if (start < stream.written || length > out->cap - out->n) return (Str){0};
+    return (Str){out->p + (start - stream.written), length};
+}
+
 Str cache_answer(const Buf *out, size start) {
     // A flush may have overwritten the beginning of this include.
     if (start < stream.written) return (Str){0};
@@ -226,6 +246,12 @@ size find_char(Str s, size i, char c) {
         int mask = __builtin_ia32_pmovmskb128(*(const Vector *)(s.p + i) == needle);
         if (mask) return i + first_bit((uint)mask);
     }
+    if (i >= 16 && i < s.n) {
+        size last = s.n - 16;
+        uint bits = __builtin_ia32_pmovmskb128(*(const Vector *)(s.p + last) == needle);
+        bits &= -1u << (i - last);
+        return bits ? last + first_bit(bits) : NPOS;
+    }
     for (; i < s.n; i++) if (s.p[i] == c) return i;
     return NPOS;
 }
@@ -235,6 +261,9 @@ int equal(Str a, Str b) {
     size n = a.n, i = 0;
     for (; n - i >= 8; i += 8)
         if (*(const Word *)(a.p + i) != *(const Word *)(b.p + i)) return 0;
+    if (i) return *(const Word *)(a.p + n - 8) == *(const Word *)(b.p + n - 8);
+    if (n >= 4) return *(const Half *)a.p == *(const Half *)b.p &&
+        *(const Half *)(a.p + n - 4) == *(const Half *)(b.p + n - 4);
     for (; i < n; i++) if (a.p[i] != b.p[i]) return 0;
     return 1;
 }
@@ -255,7 +284,19 @@ static uint hash(Str s) {
     size h = 0x84222325cbf29ce4UL;
     size i = 0;
     for (; s.n - i >= 8; i += 8) h = (h ^ (size)*(const Word *)(s.p + i)) * 0x100000001b3UL;
-    for (; i < s.n; i++) h = (h ^ (byte)s.p[i]) * 0x100000001b3UL;
+    if (i < s.n) {
+        size tail;
+        if (i) tail = (size)*(const Word *)(s.p + s.n - 8);
+        else if (s.n >= 4)
+            tail = (size)*(const Half *)s.p | ((size)*(const Half *)(s.p + s.n - 4) << 32);
+        else {
+            tail = (byte)s.p[0] | (uint)(byte)s.p[s.n - 1] << 8;
+            if (s.n == 3) tail |= (uint)(byte)s.p[1] << 16;
+        }
+        h = (h ^ tail) * 0x100000001b3UL;
+    }
+    h ^= s.n;
+    h ^= h >> 29;
     uint folded = h ^ (h >> 32);
     return folded ? folded : 1;
 }

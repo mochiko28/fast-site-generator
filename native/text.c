@@ -95,6 +95,13 @@ int compare(Str a, Str b) {
             break;
         }
     }
+    if (i + 8 <= n) {
+        typedef size Word __attribute__((aligned(1), may_alias));
+        size x = *(const Word *)(a.p + i), y = *(const Word *)(b.p + i);
+        size diff = x ^ y;
+        if (!diff) i += 8;
+        else i += __builtin_ctzl(diff) / 8;
+    }
     for (; i < n; i++) {
         int x = (byte)a.p[i], y = (byte)b.p[i];
         if (x == y) continue;
@@ -131,7 +138,20 @@ size space_width(Str s, size i) {
 }
 
 int has_space(Str s) {
-    for (size i = 0; i < s.n; i++) {
+    size i = 0;
+    for (; s.n - i >= 16; i += 16) {
+        Vec bytes = *(const Vec *)(s.p + i);
+        Vec ascii = (bytes == SPLAT(' ')) | ((bytes > SPLAT(8)) & (bytes < SPLAT(14)));
+        if (__builtin_ia32_pmovmskb128(ascii)) return 1;
+        if (!__builtin_ia32_pmovmskb128(bytes)) continue;
+        uint leads = __builtin_ia32_pmovmskb128(
+            (bytes == SPLAT((char)0xc2)) | (bytes == SPLAT((char)0xe1)) |
+            (bytes == SPLAT((char)0xe2)) | (bytes == SPLAT((char)0xe3)) |
+            (bytes == SPLAT((char)0xef)));
+        for (; leads; leads &= leads - 1)
+            if (space_width(s, i + first_bit(leads))) return 1;
+    }
+    for (; i < s.n; i++) {
         int c = (byte)s.p[i];
         if (c <= ' ' || c >= 0xc2)
             if (space_width(s, i)) return 1;
@@ -231,6 +251,10 @@ static size next_json(Str s, size i, int html, int unicode) {
     uint mask = 1 | (html ? 2 : 0) | (unicode == 1 ? 8 : unicode == 2 ? 4 : 0);
     for (; i < s.n && !(escape_class[(byte)s.p[i]] & mask); i++) {}
     return i;
+}
+
+Value template_text(Str s) {
+    return next_json(s, 0, 1, latin1 ? 0 : 2) == s.n ? literal_string(s) : string(s);
 }
 
 static Str json_escape(int c) {
@@ -336,38 +360,36 @@ static Str slug_projection(uint cp) {
     return S("-");
 }
 
-static void slug_byte(char *buf, size *n, int *gap, int c) {
-    uint lower = (uint)c | 32u;
-    if (lower - 'a' <= 'z' - 'a') c = lower;
-    else if ((uint)c - '0' > 9) {
-        *gap = *n != 0;
-        return;
-    }
-    if (*gap) {
-        if (*n == 63) {
-            *n = 64;
-            buf[63] = '-';
-            return;
-        }
-        buf[(*n)++] = '-';
-        *gap = 0;
-    }
-    buf[(*n)++] = c;
+static const byte slug_ascii[] = {
+    '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-',
+    '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-',
+    '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '-', '-', '-', '-', '-',
+    '-', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '-', '-', '-', '-', '-',
+    '-', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '-', '-', '-', '-', '-'
+};
+
+static inline void slug_byte(char *buf, size *n, byte c) {
+    byte folded = slug_ascii[c];
+    buf[*n] = folded;
+    // Skip leading and repeated separators. Trim the trailing one at the end.
+    *n += folded != '-' || (*n && buf[*n - 1] != '-');
 }
 
 Str slugify(Str s) {
     char chars[64];
     size n = 0;
-    int gap = 0;
     for (size i = 0; i < s.n && n < sizeof(chars);) {
         uint c = (byte)s.p[i];
         if (c < 128) {
             i++;
-            slug_byte(chars, &n, &gap, c);
+            slug_byte(chars, &n, c);
         } else {
             Str projection = slug_projection(decode(s, &i));
             for (size j = 0; j < projection.n && n < sizeof(chars); j++)
-                slug_byte(chars, &n, &gap, projection.p[j]);
+                slug_byte(chars, &n, projection.p[j]);
         }
     }
     if (n && chars[n - 1] == '-') n--;
@@ -484,16 +506,16 @@ static const byte field_slots[][PROP_URL + 1] = {
 const Value *property(const Value *value, enum Property name) {
     if (!value || name == PROP_UNKNOWN) return 0;
     if (value->kind == RECORD) {
-        enum RecordLayout layout = value->record.layout;
+        enum RecordLayout layout = value->shape.layout;
         uint slot = field_slots[layout][name];
-        if (!slot || slot > value->record.n) return 0;
-        if (layout <= HEADING_FIELDS) return &value->record.values[slot - 1];
-        return value->record.items[slot - 1];
+        if (!slot || slot > value->shape.fields) return 0;
+        if (layout <= HEADING_FIELDS) return &value->values[slot - 1];
+        return value->fields[slot - 1];
     }
     if (value->kind == ARRAY && name == PROP_LENGTH) {
         // Template paths cannot contain a numeric segment.
         static Value length;
-        length = numeric(value->array.n);
+        length = numeric(value->n);
         return &length;
     }
     return 0;

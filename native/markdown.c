@@ -3,36 +3,69 @@
 typedef char Vec __attribute__((vector_size(16), aligned(1), may_alias));
 #define SPLAT(c) ((Vec){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c})
 
-static int escapable(int c) {
-    switch (c) {
-        case '\\': case '`': case '*': case '_': case '[': case ']':
-        case '(': case ')': case '#': case '+': case '-': case '.': case '!': case '>':
-            return 1;
-        default: return 0;
-    }
-}
-
-typedef struct { char text[8]; byte length; } Entity;
-static const Entity escapes[64] = {
-    ['&'] = {"&amp;", 5}, ['<'] = {"&lt;", 4}, ['>'] = {"&gt;", 4},
-    ['"'] = {"&quot;", 6}, ['\''] = {"&#39;", 5},
+static const byte escapable[128] = {
+    ['\\'] = 1, ['`'] = 1, ['*'] = 1, ['_'] = 1, ['['] = 1, [']'] = 1,
+    ['('] = 1, [')'] = 1, ['#'] = 1, ['+'] = 1, ['-'] = 1, ['.'] = 1, ['!'] = 1, ['>'] = 1,
 };
 
-enum InlineMark { PLAIN, ENTITY, CONTROL, BACKSLASH, BACKTICK, STAR, LABEL, SURROGATE };
-static const byte inline_class[256] = {
-    [0 ... 31] = CONTROL, ['&'] = ENTITY, ['<'] = ENTITY, ['>'] = ENTITY,
-    ['"'] = ENTITY, ['\''] = ENTITY, ['\\'] = BACKSLASH, ['\x60'] = BACKTICK,
-    ['*'] = STAR, ['['] = LABEL, [0xed] = SURROGATE,
+typedef struct { char text[7]; byte length; } Entity;
+#define ENTITY(c, s) [c] = {s, sizeof(s) - 1}
+static const Entity escapes[128] = {
+    ENTITY(0, "\\u0000"), ENTITY(1, "\\u0001"), ENTITY(2, "\\u0002"), ENTITY(3, "\\u0003"),
+    ENTITY(4, "\\u0004"), ENTITY(5, "\\u0005"), ENTITY(6, "\\u0006"), ENTITY(7, "\\u0007"),
+    ENTITY(8, "\\b"), ENTITY(9, "\\t"), ENTITY(10, "\\n"), ENTITY(11, "\\u000b"),
+    ENTITY(12, "\\f"), ENTITY(13, "\\r"), ENTITY(14, "\\u000e"), ENTITY(15, "\\u000f"),
+    ENTITY(16, "\\u0010"), ENTITY(17, "\\u0011"), ENTITY(18, "\\u0012"), ENTITY(19, "\\u0013"),
+    ENTITY(20, "\\u0014"), ENTITY(21, "\\u0015"), ENTITY(22, "\\u0016"), ENTITY(23, "\\u0017"),
+    ENTITY(24, "\\u0018"), ENTITY(25, "\\u0019"), ENTITY(26, "\\u001a"), ENTITY(27, "\\u001b"),
+    ENTITY(28, "\\u001c"), ENTITY(29, "\\u001d"), ENTITY(30, "\\u001e"), ENTITY(31, "\\u001f"),
+    ENTITY('&', "&amp;"), ENTITY('<', "&lt;"), ENTITY('>', "&gt;"),
+    ENTITY('"', "&quot;"), ENTITY('\'', "&#39;"),
+    ENTITY('#', "#"),
+    ENTITY('\\', "\\\\"), ENTITY('^', "^"), ENTITY('|', "|"), ENTITY('~', "~"),
 };
+#undef ENTITY
 
 static inline uint marks(Vec bytes, Vec surrogate) {
-    // The grouped byte tests include a few plain bytes, handled by inline_class.
+    // Grouped byte tests also flag a few ASCII literals. The caller copies them unchanged.
     Vec hits = ((bytes ^ SPLAT(-128)) < SPLAT(-96)) |
         ((bytes & SPLAT((char)0xfa)) == SPLAT('"')) |
         ((bytes & SPLAT((char)0x9d)) == SPLAT(0x1c)) |
         (bytes == SPLAT('[')) | (bytes == SPLAT('*')) |
         (bytes == SPLAT('\x60')) | (bytes == surrogate);
     return __builtin_ia32_pmovmskb128(hits);
+}
+
+// Code spans and fences borrow SIMD-padded Markdown storage, and their
+// escaped text is appended to the same contiguous HTML arena.
+static void escape_code(Buf *out, Str s) {
+    if (!latin1 || s.n * 6 + 16 > out->cap - out->n) {
+        json(out, s, 1, 0);
+        return;
+    }
+    char *dst = out->p + out->n;
+    size i = 0;
+    while (i < s.n) {
+        Vec w = *(const Vec *)(s.p + i);
+        *(Vec *)dst = w;
+        Vec marked = ((w & SPLAT((char)0xe0)) == SPLAT(0)) |
+            ((w & SPLAT((char)0xfa)) == SPLAT('"')) |
+            ((w & SPLAT((char)0x9d)) == SPLAT(0x1c));
+        uint bits = __builtin_ia32_pmovmskb128(marked);
+        size count = bits ? first_bit(bits) : 16;
+        if (count >= s.n - i) {
+            dst += s.n - i;
+            break;
+        }
+        dst += count;
+        i += count;
+        if (bits) {
+            const Entity *escape = &escapes[(byte)s.p[i++]];
+            __builtin_memcpy(dst, escape, sizeof(*escape));
+            dst += escape->length;
+        }
+    }
+    out->n = dst - out->p;
 }
 
 static inline size arena_char(Str s, size from, char c) {
@@ -56,6 +89,24 @@ static size closer(Str s, size from, char c, int strong, int single_star) {
         if ((i - slash) & 1) continue;
         if (!single_star || at(s, i + 1) != '*') return i;
         i++;
+    }
+    return NPOS;
+}
+
+static size link_end(Str s, size i) {
+    for (; i < s.n; i += 16) {
+        Vec w = *(const Vec *)(s.p + i);
+        Vec ws = (w == SPLAT(' ')) | ((w > SPLAT(8)) & (w < SPLAT(14)));
+        uint closing = __builtin_ia32_pmovmskb128(w == SPLAT(')'));
+        uint gaps = __builtin_ia32_pmovmskb128(ws);
+        uint high = __builtin_ia32_pmovmskb128(w);
+        uint marks = closing | gaps | high;
+        for (; marks; marks &= marks - 1) {
+            uint j = first_bit(marks);
+            if (i + j >= s.n) return NPOS;
+            if ((closing >> j) & 1) return i + j;
+            if (((gaps >> j) & 1) || space_width(s, i + j)) return NPOS;
+        }
     }
     return NPOS;
 }
@@ -84,26 +135,17 @@ static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uin
 
         unsigned c = (byte)s.p[i];
         size next = i + 1;
-        switch (inline_class[c]) {
-            case ENTITY: {
-                const Entity *entity = &escapes[c];
-                __builtin_memcpy(dst, entity->text, sizeof(entity->text));
-                dst += entity->length;
-                break;
-            }
-            case CONTROL:
-                if (c == '\n') {
-                    *dst++ = '\\';
-                    *dst++ = 'n';
-                } else {
-                    out->n = dst - out->p;
-                    json_ascii(out, c);
-                    dst = out->p + out->n;
-                }
-                break;
-            case BACKSLASH:
+        if (c < 64 && c != '*') {
+            const Entity *entity = &escapes[c];
+            __builtin_memcpy(dst, entity, sizeof(*entity));
+            dst += entity->length;
+            i++;
+            continue;
+        }
+        switch (c) {
+            case '\\':
                 c = at(s, next);
-                if (!escapable(c)) {
+                if (c >= COUNT(escapable) || !escapable[c]) {
                     *dst++ = '\\';
                     *dst++ = '\\';
                 } else {
@@ -117,20 +159,48 @@ static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uin
                     }
                 }
                 break;
-            case BACKTICK: {
+            case 0x60: {
                 size end = arena_char(s, next, '\x60');
                 if (end == NPOS || end == next) goto literal;
                 out->n = dst - out->p;
                 ADD(out, "<code>");
-                json(out, slice(s, next, end), 1, 0);
+                escape_code(out, slice(s, next, end));
                 ADD(out, "</code>");
                 next = end + 1;
                 dst = room(out, (s.n - next) * 6 + 16);
                 break;
             }
-            case STAR: {
+            case '*': {
                 int strong = at(s, next) == '*';
                 next += strong;
+                // Consume a plain emphasis span directly when its closer is
+                // also the next marked byte in the SIMD load.
+                uint remaining = hits & (-1u << (plain + 1 + strong));
+                if (remaining) {
+                    size end = i - plain + first_bit(remaining);
+                    if (end > next && end < s.n && s.p[end] == '*' &&
+                        (at(s, end + 1) == '*') == strong) {
+                        if (strong) {
+                            __builtin_memcpy(dst, "<strong>", 8);
+                            dst += 8;
+                        } else {
+                            __builtin_memcpy(dst, "<em>", 4);
+                            dst += 4;
+                        }
+                        *(Vec *)dst = *(const Vec *)(s.p + next);
+                        dst += end - next;
+                        if (strong) {
+                            __builtin_memcpy(dst, "</strong>", 9);
+                            dst += 9;
+                        } else {
+                            __builtin_memcpy(dst, "</em>", 5);
+                            dst += 5;
+                        }
+                        // Plain emphasis fits in the existing six-byte expansion bound.
+                        i = end + 1 + strong;
+                        continue;
+                    }
+                }
                 size end = closer(s, next, '*', strong, !strong);
                 if (end == NPOS || end == next) {
                     *dst++ = '*';
@@ -145,7 +215,7 @@ static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uin
                 dst = room(out, (s.n - next) * 6 + 16);
                 break;
             }
-            case LABEL: {
+            case '[': {
                 if (!labels) goto literal;
                 size label_end = closer(s, next, ']', 0, 0);
                 if (label_end == NPOS) {
@@ -153,14 +223,14 @@ static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uin
                     goto literal;
                 }
                 if (at(s, label_end + 1) != '(') goto literal;
-                size end = arena_char(s, label_end + 2, ')');
+                size end = link_end(s, label_end + 2);
                 if (end == NPOS || end == label_end + 2) goto literal;
                 Str target = slice(s, label_end + 2, end);
-                if (has_space(target)) goto literal;
-                Str href = resolve(context, target);
+                Value href = resolve(context, target);
                 out->n = dst - out->p;
                 ADD(out, "<a href=\\\"");
-                json(out, href, 1, 0);
+                if (href.kind == LITERAL_STRING) append(out, value_text(&href));
+                else json(out, value_text(&href), 1, 0);
                 ADD(out, "\\\">");
                 inline_html(out, slice(s, next, label_end), resolve, context, depth + 1);
                 ADD(out, "</a>");
@@ -168,7 +238,7 @@ static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uin
                 dst = room(out, (s.n - next) * 6 + 16);
                 break;
             }
-            case SURROGATE: {
+            case 0xed: {
                 next = i;
                 uint cp = decode(s, &next);
                 if (cp < 0xd800 || cp > 0xdfff) goto literal;
@@ -177,7 +247,7 @@ static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uin
                 dst = out->p + out->n;
                 break;
             }
-            case PLAIN:
+            default:
 literal:
                 *dst++ = s.p[i];
                 next = i + 1;
@@ -194,21 +264,36 @@ static int fence_char(int c) {
     return letter(c) || digit(c) || c == '_' || c == '+' || c == '-';
 }
 
+enum BlockLead { TEXT_LEAD, INDENT_LEAD, HEADING_LEAD, FENCE_LEAD, RULE_LEAD };
+static const byte block_lead[256] = {
+    [' '] = INDENT_LEAD, ['\t'] = INDENT_LEAD, ['#'] = HEADING_LEAD,
+    [0x60] = FENCE_LEAD, ['-'] = RULE_LEAD, ['*'] = RULE_LEAD,
+};
+
 static int block(Str line) {
-    int c = at(line, 0);
-    if (c == -1 || (indent(c) && only_indent(tail(line, 1)))) return BLANK;
-    if (c == '#') {
-        size n = 1;
-        while (at(line, n) == '#') n++;
-        if (n <= 6 && indent(at(line, n)) && !only_indent(tail(line, n + 1))
-            && !has_line_separator(tail(line, n))) return n;
-    } else if (c == '`' && starts(line, S("```"))) {
-        size i = 3;
-        while (fence_char(at(line, i))) i++;
-        if (only_indent(tail(line, i))) return FENCE;
-    } else if ((c == '-' || c == '*') && at(line, 1) == c && at(line, 2) == c
-        && only_indent(tail(line, 3))) {
-        return BREAK;
+    if (!line.n) return BLANK;
+    int c = (byte)line.p[0];
+    switch (block_lead[c]) {
+        case INDENT_LEAD:
+            if (only_indent(tail(line, 1))) return BLANK;
+            break;
+        case HEADING_LEAD: {
+            size n = 1;
+            while (at(line, n) == '#') n++;
+            if (n <= 6 && indent(at(line, n)) && !only_indent(tail(line, n + 1))
+                && !has_line_separator(tail(line, n))) return n;
+            break;
+        }
+        case FENCE_LEAD:
+            if (at(line, 1) == 0x60 && at(line, 2) == 0x60) {
+                size i = 3;
+                while (fence_char(at(line, i))) i++;
+                if (only_indent(tail(line, i))) return FENCE;
+            }
+            break;
+        case RULE_LEAD:
+            if (at(line, 1) == c && at(line, 2) == c && only_indent(tail(line, 3))) return BREAK;
+            break;
     }
     return PARAGRAPH;
 }
@@ -234,7 +319,9 @@ typedef struct {
     Str body, line;
     size at, end, next;
     size words;
-    uint breaks, width, preceding_gap, carry;
+    uint preceding_gap, carry;
+    uint read_line, end_lines;
+    uint ends[128];  // Byte offsets within the bounded input arena.
 } Lines;
 
 // Count word starts from the two bytes of a SIMD mask on baseline x86-64.
@@ -253,16 +340,25 @@ static uint bit_count(uint bits) {
 typedef char Wide __attribute__((vector_size(32), aligned(1), may_alias));
 #define SPLAT_WIDE(c) ((Wide){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c})
 
+static inline uint queue_lines(uint *ends, uint count, size base, uint breaks) {
+    for (; breaks; breaks &= breaks - 1)
+        ends[count++] = base + first_bit(breaks);
+    return count;
+}
+
 static __attribute__((target("avx2,popcnt"), noinline)) void scan_wide(Lines *lines) {
     Str body = lines->body;
     size i = lines->next;
-    for (; body.n - i >= 32; i += 32) {
+    int count_words = body.n > 400;
+    size words = 0, gaps = lines->preceding_gap | ((size)lines->carry << 1);
+    uint count = lines->end_lines;
+    for (; body.n - i >= 32 && count <= COUNT(lines->ends) - 32; i += 32) {
         Wide w = *(const Wide *)(body.p + i);
         uint breaks = __builtin_ia32_pmovmskb256(w == SPLAT_WIDE('\n'));
-        if (body.n > 400) {
+        if (count_words) {
             Wide ws = (w == SPLAT_WIDE(' ')) | ((w > SPLAT_WIDE(8)) & (w < SPLAT_WIDE(14)));
             // Keep enough high bits for whitespace that crosses into the next vector.
-            size gaps = lines->carry | (uint)__builtin_ia32_pmovmskb256(ws);
+            size mask = (gaps >> 1) | (uint)__builtin_ia32_pmovmskb256(ws);
             if (__builtin_ia32_pmovmskb256(w)) {
                 uint leads = __builtin_ia32_pmovmskb256(
                     (w == SPLAT_WIDE((char)0xc2)) | (w == SPLAT_WIDE((char)0xe1)) |
@@ -271,38 +367,37 @@ static __attribute__((target("avx2,popcnt"), noinline)) void scan_wide(Lines *li
                 for (; leads; leads &= leads - 1) {
                     uint j = first_bit(leads);
                     size width = space_width(body, i + j);
-                    gaps |= ((1UL << width) - 1) << j;
+                    mask |= ((1UL << width) - 1) << j;
                 }
             }
-            lines->words += __builtin_popcount((uint)(~gaps & ((gaps << 1) | lines->preceding_gap)));
-            lines->preceding_gap = (gaps >> 31) & 1;
-            lines->carry = gaps >> 32;
+            words += __builtin_popcount((uint)(~mask & ((mask << 1) | (gaps & 1))));
+            // Keep the preceding gap and any carried lanes together.
+            gaps = mask >> 31;
         }
-        if (breaks) {
-            lines->breaks = breaks;
-            i += 32;
-            break;
-        }
+        count = queue_lines(lines->ends, count, i, breaks);
     }
+    lines->end_lines = count;
+    lines->words += words;
+    lines->preceding_gap = gaps & 1;
+    lines->carry = gaps >> 1;
     lines->next = i;
-    lines->width = 32;
 }
 
-// A vector may contain several lines. Keep its remaining breaks for advance()
-// and count word starts when loading the vector.
-static size scan_line_end(Lines *lines) {
+// Queue a batch of line ends while visiting each vector for the word count.
+static __attribute__((noinline)) void scan_lines(Lines *lines) {
     Str body = lines->body;
-    if (!lines->breaks && has_avx2 && lines->next < body.n && body.n - lines->next >= 32)
+    lines->read_line = lines->end_lines = 0;
+    if (has_avx2 && lines->next < body.n && body.n - lines->next >= 32)
         scan_wide(lines);
-    while (!lines->breaks) {
-        size i = lines->next;
-        if (i >= body.n) return body.n;
+    int count_words = body.n > 400;
+    for (size i = lines->next; i < body.n && lines->end_lines <= COUNT(lines->ends) - 16; i += 16) {
+        // Stay on the wide path until only the final partial vector remains.
+        if (has_avx2 && body.n - i >= 32) break;
         Vec w = *(const Vec *)(body.p + i);
         uint valid = body.n - i >= 16 ? 0xffff : (1u << (body.n - i)) - 1;
-        lines->next += 16;
-        lines->width = 16;
-        lines->breaks = __builtin_ia32_pmovmskb128(w == SPLAT('\n')) & valid;
-        if (body.n > 400) {
+        lines->next = i + 16;
+        uint breaks = __builtin_ia32_pmovmskb128(w == SPLAT('\n')) & valid;
+        if (count_words) {
             Vec ws = (w == SPLAT(' ')) | ((w > SPLAT(8)) & (w < SPLAT(14)));
             uint gaps = lines->carry | (uint)__builtin_ia32_pmovmskb128(ws);
             if (__builtin_ia32_pmovmskb128(w)) {
@@ -320,10 +415,10 @@ static size scan_line_end(Lines *lines) {
             lines->preceding_gap = (gaps >> 15) & 1;
             lines->carry = gaps >> 16;
         }
+        lines->end_lines = queue_lines(lines->ends, lines->end_lines, i, breaks);
     }
-    size end = lines->next - lines->width + first_bit(lines->breaks);
-    lines->breaks &= lines->breaks - 1;
-    return end;
+    if (lines->next >= body.n && lines->end_lines < COUNT(lines->ends))
+        lines->ends[lines->end_lines++] = body.n;
 }
 
 static void advance(Lines *lines) {
@@ -332,7 +427,8 @@ static void advance(Lines *lines) {
         lines->line = (Str){0};
         return;
     }
-    lines->end = scan_line_end(lines);
+    if (lines->read_line == lines->end_lines) scan_lines(lines);
+    lines->end = lines->ends[lines->read_line++];
     lines->line = slice(lines->body, lines->at, lines->end);
 }
 
@@ -352,9 +448,9 @@ static void code_block(Buf *html, Lines *lines) {
         if (starts(lines->line, S("```")) && only_indent(tail(lines->line, 3))) break;
         advance(lines);
     }
-    if (lines->at <= body.n) json(html, slice(body, first, lines->at), 1, 0);
+    if (lines->at <= body.n) escape_code(html, slice(body, first, lines->at));
     else if (first <= body.n) {
-        json(html, tail(body, first), 1, 0);
+        escape_code(html, tail(body, first));
         ADD(html, "\\n");
     }
     ADD(html, "</code></pre>\\n");
@@ -414,10 +510,11 @@ static void list_block(Buf *html, Lines *lines, size marker, ResolveLink resolve
 
 static Str paragraph(Lines *lines, int *kind) {
     size from = lines->at, to;
-    Buf *text = start_markdown_text();
+    Buf *text = 0;
     do {
         Str line = lines->line;
-        if (indent(at(line, 0)) || indent(at(line, line.n - 1))) {
+        if (line.n && (indent(line.p[0]) || indent(line.p[line.n - 1]))) {
+            if (!text) text = start_markdown_text();
             append(text, slice(lines->body, from, lines->at));
             append(text, trim_line(line));
             from = lines->end;
@@ -427,7 +524,7 @@ static Str paragraph(Lines *lines, int *kind) {
         *kind = block(lines->line);
     } while (*kind == PARAGRAPH);
     Str last = slice(lines->body, from, to);
-    if (!text->n) return last;
+    if (!text || !text->n) return last;
     append(text, last);
     return take(text);
 }
@@ -474,7 +571,7 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
                 Heading *heading = NEW(Heading, 1);
                 heading->next = 0;
                 heading->fields[0] = numeric(kind);
-                heading->fields[1] = string(id);
+                heading->fields[1] = literal_string(id);
                 heading->fields[2] = rendered(tail(take(&html), from));
                 heading->item = record_values(HEADING_FIELDS, heading->fields, COUNT(heading->fields));
                 *next = heading;

@@ -3,16 +3,27 @@
 enum JsonKind { JSTRING, JNUMBER, JARRAY, JOBJECT, JNULL, JBOOLEAN };
 
 typedef struct Json Json;
+// The input window bounds every JSON slice and stays at one address during parsing.
+typedef struct { uint start, length; } InputSlice;
 struct Json {
     Json *next;
-    Str key;
     union {
-        Str text;
-        struct { Json *child; size count; };
+        InputSlice text;
+        Json *child;
     };
-    enum JsonKind kind;
-    int has_cr;
+    InputSlice key;
+    uint count;
+    byte kind, has_cr;
 };
+
+static const char *input_base;
+
+static inline InputSlice input_slice(Str s) {
+    return (InputSlice){s.p ? s.p - input_base : 0, s.n};
+}
+static inline Str read_slice(InputSlice s) {
+    return (Str){input_base + s.start, s.length};
+}
 
 #define INPUT_CHUNK (128UL << 10)
 #define SCAN_CHUNK (256UL << 10)
@@ -55,10 +66,23 @@ static inline int parser_at(Parser *p, size i) {
     return (byte)p->source.p[i];
 }
 
-static int peek(Parser *p) {
-    int c;
-    while (json_space(c = parser_at(p, p->pos))) p->pos++;
-    return c;
+static inline int peek(Parser *p) {
+    size i = p->pos;
+    for (;;) {
+        Str source = p->source;
+        while (i < source.n) {
+            int c = (byte)source.p[i];
+            if (!json_space(c)) {
+                p->pos = i;
+                return c;
+            }
+            i++;
+        }
+        if (!refill(p, i)) {
+            p->pos = i;
+            return -1;
+        }
+    }
 }
 
 // Between cases no parsed string refers to the input. Discard completely
@@ -97,7 +121,7 @@ static int hex4(Str input, size pos) {
 }
 
 static uint string_marks(Vec bytes) {
-    Vec hit = ((bytes ^ SPLAT(-128)) < SPLAT(-96)) | (bytes == SPLAT('"')) | (bytes == SPLAT('\\'));
+    Vec hit = ((bytes & SPLAT((char)0xe0)) == SPLAT(0)) | (bytes == SPLAT('"')) | (bytes == SPLAT('\\'));
     return __builtin_ia32_pmovmskb128(hit);
 }
 
@@ -113,8 +137,24 @@ static size json_mark(Str input, size i) {
     return input.n;
 }
 
-static int has_unicode_escape(Str input) {
+typedef char Wide __attribute__((vector_size(32), aligned(1), may_alias));
+#define SPLAT_WIDE(c) ((Wide){c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c})
+
+static __attribute__((target("avx2"), noinline)) size unicode_escape_wide(Str input) {
     size i = 0;
+    for (; input.n - i >= 33; i += 32) {
+        Wide first = *(const Wide *)(input.p + i);
+        Wide second = *(const Wide *)(input.p + i + 1);
+        uint hits = __builtin_ia32_pmovmskb256((first == SPLAT_WIDE('\\')) & (second == SPLAT_WIDE('u')));
+        for (; hits; hits &= hits - 1)
+            if (hex4(input, i + first_bit(hits) + 2) >= 128) return NPOS;
+    }
+    return i;
+}
+
+static int has_unicode_escape(Str input) {
+    size i = has_avx2 ? unicode_escape_wide(input) : 0;
+    if (i == NPOS) return 1;
     for (; input.n - i >= 17; i += 16) {
         Vec first = *(const Vec *)(input.p + i);
         Vec second = *(const Vec *)(input.p + i + 1);
@@ -127,15 +167,84 @@ static int has_unicode_escape(Str input) {
     return 0;
 }
 
-static const byte unescape[128] = {
+static const unsigned short unescape[256] = {
     ['\\'] = '\\', ['"'] = '"', ['/'] = '/',
-    ['b'] = '\b', ['f'] = '\f', ['n'] = '\n', ['r'] = '\r', ['t'] = '\t',
+    ['b'] = '\b', ['f'] = '\f', ['n'] = '\n', ['r'] = 256 | '\r', ['t'] = '\t',
 };
 
+// Shuffle a single escape byte out of a full vector.
+static const Vec drop_lane[16] = {
+    {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0},
+    {0,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0},
+    {0,1,3,4,5,6,7,8,9,10,11,12,13,14,15,0},
+    {0,1,2,4,5,6,7,8,9,10,11,12,13,14,15,0},
+    {0,1,2,3,5,6,7,8,9,10,11,12,13,14,15,0},
+    {0,1,2,3,4,6,7,8,9,10,11,12,13,14,15,0},
+    {0,1,2,3,4,5,7,8,9,10,11,12,13,14,15,0},
+    {0,1,2,3,4,5,6,8,9,10,11,12,13,14,15,0},
+    {0,1,2,3,4,5,6,7,9,10,11,12,13,14,15,0},
+    {0,1,2,3,4,5,6,7,8,10,11,12,13,14,15,0},
+    {0,1,2,3,4,5,6,7,8,9,11,12,13,14,15,0},
+    {0,1,2,3,4,5,6,7,8,9,10,12,13,14,15,0},
+    {0,1,2,3,4,5,6,7,8,9,10,11,13,14,15,0},
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,14,15,0},
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,15,0},
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0}
+};
+
+static __attribute__((target("avx2"), noinline)) size copy_json_wide(
+    Str input, size from, char **destination, uint *carriage_return, int *special) {
+    char *write = *destination;
+    uint cr = *carriage_return;
+    const char *bytes = input.p;
+    const char *read = bytes + from;
+    const char *limit = bytes + input.n;
+    while (limit - read >= 16) {
+        Vec block = *(const Vec *)read;
+        uint hits = string_marks(block);
+        if (!hits) {
+            *(Vec *)write = block;
+            read += 16;
+            write += 16;
+            continue;
+        }
+        uint n = first_bit(hits);
+        if (read[n] == '\\' && n < 15) {
+            uint decoded = unescape[(byte)read[n + 1]];
+            if (decoded) {
+                if (!(hits >> (n + 2))) {
+                    *(Vec *)write = __builtin_ia32_pshufb128(block, drop_lane[n + 1]);
+                    write[n] = (byte)decoded;
+                    write += 15;
+                    read += 16;
+                } else {
+                    if (read + n - write >= 16) *(Vec *)write = block;
+                    else copy(write, read, n);
+                    write[n] = (byte)decoded;
+                    write += n + 1;
+                    read += n + 2;
+                }
+                cr |= decoded;
+                continue;
+            }
+        }
+        if (read + n - write >= 16) *(Vec *)write = block;
+        else copy(write, read, n);
+        write += n;
+        read += n;
+        *special = 1;
+        goto done;
+    }
+    *special = 0;
+done:
+    *destination = write;
+    *carriage_return = cr;
+    return read - bytes;
+}
+
 static Str read_string(Parser *p, int *has_cr) {
-    expect(p, '"');
     Str input = p->source;
-    size from = p->pos;
+    size from = ++p->pos;
     size end = json_mark(input, from);
     while (end == input.n && refill(p, end)) {
         input = p->source;
@@ -148,15 +257,19 @@ static Str read_string(Parser *p, int *has_cr) {
     // Decode into the input buffer. The read cursor stays ahead of the write cursor.
     char *text = (char *)input.p + from;
     char *write = (char *)input.p + end;
+    uint carriage_return = 0;
     for (;;) {
+decode_escape:
+        if (at(input, end) == '"') break;
         if (at(input, end) != '\\') fail();
         unsigned c = parser_at(p, end + 1);
         input = p->source;
         from = end + 2;
-        byte decoded = c < COUNT(unescape) ? unescape[c] : 0;
+        if (c >= COUNT(unescape)) fail();
+        uint decoded = unescape[c];
         if (decoded) {
-            *write++ = decoded;
-            if (decoded == '\r' && has_cr) *has_cr = 1;
+            *write++ = (byte)decoded;
+            carriage_return |= decoded;
         } else {
             if (c != 'u') fail();
             if (end + 11 >= input.n) {
@@ -165,7 +278,7 @@ static Str read_string(Parser *p, int *has_cr) {
             }
             int cp = hex4(input, from);
             if (cp < 0) fail();
-            if (has_cr && cp == '\r') *has_cr = 1;
+            if (cp == '\r') carriage_return |= 256;
             from += 4;
             if (cp >= 0xd800 && cp <= 0xdbff && at(input, from) == '\\' && at(input, from + 1) == 'u') {
                 int low = hex4(input, from + 2);
@@ -177,6 +290,36 @@ static Str read_string(Parser *p, int *has_cr) {
             Buf encoded = {write, 0, 4};
             encode(&encoded, cp);
             write += encoded.n;
+        }
+        if (has_avx2 && input.n - from >= 16) {
+            int special;
+            from = copy_json_wide(input, from, &write, &carriage_return, &special);
+            if (special) {
+                end = from;
+                goto decode_escape;
+            }
+        } else if (input.p + from - write >= 16) {
+            // The speculative store stays entirely behind the unread source.
+            while (input.n - from >= 16) {
+                Vec bytes = *(const Vec *)(input.p + from);
+                *(Vec *)write = bytes;
+                uint hits = string_marks(bytes);
+                if (!hits) {
+                    from += 16;
+                    write += 16;
+                    continue;
+                }
+                uint n = first_bit(hits);
+                end = from + n;
+                write += n;
+                if (input.p[end] != '\\' || end + 1 == input.n)
+                    goto decode_escape;
+                uint simple = unescape[(byte)input.p[end + 1]];
+                if (!simple) goto decode_escape;
+                *write++ = (byte)simple;
+                carriage_return |= simple;
+                from = end + 2;
+            }
         }
         for (;;) {
             if (from >= input.n) {
@@ -202,9 +345,9 @@ static Str read_string(Parser *p, int *has_cr) {
             write += 16;
             from += 16;
         }
-        if (at(input, end) == '"') break;
     }
     p->pos = end + 1;
+    if (has_cr) *has_cr = carriage_return >> 8;
     return (Str){text, write - text};
 }
 
@@ -241,8 +384,9 @@ static Json *read_value(Parser *p, uint depth) {
     value->next = 0;
     if (first == '"') {
         value->kind = JSTRING;
-        value->has_cr = 0;
-        value->text = read_string(p, &value->has_cr);
+        int has_cr = 0;
+        value->text = input_slice(read_string(p, &has_cr));
+        value->has_cr = has_cr;
     } else if (first == '[' || first == '{') {
         value->kind = first == '[' ? JARRAY : JOBJECT;
         int close = first == '[' ? ']' : '}';
@@ -253,11 +397,12 @@ static Json *read_value(Parser *p, uint depth) {
             for (;;) {
                 Str name = {0};
                 if (first == '{') {
+                    if (peek(p) != '"') fail();
                     name = read_string(p, 0);
                     expect(p, ':');
                 }
                 Json *item = read_value(p, depth + 1);
-                item->key = name;
+                item->key = input_slice(name);
                 *next = item;
                 next = &item->next;
                 value->count++;
@@ -269,7 +414,7 @@ static Json *read_value(Parser *p, uint depth) {
         expect(p, close);
     } else if (first == '-' || digit(first)) {
         value->kind = JNUMBER;
-        value->text = read_number(p);
+        value->text = input_slice(read_number(p));
     } else {
         Str token = first == 't' ? S("true") : first == 'f' ? S("false") : S("null");
         size end = p->pos + token.n - 1;
@@ -285,19 +430,19 @@ static const Json *field(const Json *node, Str name) {
     if (!node || node->kind != JOBJECT) fail();
     const Json *last = 0;
     for (const Json *f = node->child; f; f = f->next)
-        if (equal(f->key, name)) last = f;
+        if (equal(read_slice(f->key), name)) last = f;
     if (!last) fail();
     return last;
 }
 
 static Str as_string(const Json *value) {
     if (value->kind != JSTRING) fail();
-    return value->text;
+    return read_slice(value->text);
 }
 
 static long as_integer(const Json *value) {
-    if (value->kind != JNUMBER || value->text.n > 10) fail();
-    Str str = value->text;
+    if (value->kind != JNUMBER || value->text.length > 10) fail();
+    Str str = read_slice(value->text);
     int negative = at(str, 0) == '-';
     str = tail(str, negative);
     for (size i = 0; i < str.n; i++) if (!digit(str.p[i])) fail();
@@ -361,7 +506,7 @@ static void warn(Site *site, Str text) {
 
 static int string_order(const void *a, const void *b) { return compare(*(const Str *)a, *(const Str *)b); }
 static int file_order(const void *a, const void *b) { return compare(((const File *)a)->path, ((const File *)b)->path); }
-static int template_order(const void *a, const void *b) { return compare(((const Json *)a)->key, ((const Json *)b)->key); }
+static int template_order(const void *a, const void *b) { return compare(read_slice(((const Json *)a)->key), read_slice(((const Json *)b)->key)); }
 
 static Str directory(Str path) {
     size i = path.n;
@@ -541,7 +686,7 @@ static Front front_matter(Str text) {
     return front;
 }
 
-static void load_templates(Site *site, const Json *templates) {
+static void load_templates(Site *site, const Json *templates, const Value *settings) {
     if (templates->kind != JOBJECT) fail();
     reserve_map(&site->templates, templates->count);
     const Json **names = NEW(const Json *, templates->count);
@@ -551,15 +696,16 @@ static void load_templates(Site *site, const Json *templates) {
 
     for (size i = 0; i < n; i++) {
         const Json *entry = names[i];
-        if (i + 1 < n && equal(entry->key, names[i + 1]->key)) continue;
+        Str name = read_slice(entry->key);
+        if (i + 1 < n && equal(name, read_slice(names[i + 1]->key))) continue;
         Template *t = NEW(Template, 1);
         *t = parse_template(as_string(entry));
-        if (t->error.n) warn(site, JOIN(S("template \""), entry->key, S("\": "), t->error));
-        else set(&site->templates, entry->key, t);
+        if (t->error.n) warn(site, JOIN(S("template \""), name, S("\": "), t->error));
+        else set(&site->templates, name, t);
     }
     for (size i = 0; i < site->templates.cap; i++) {
         Template *t = site->templates.entries[i].val;
-        if (t) prepare_template(t, &site->templates);
+        if (t) prepare_template(t, &site->templates, settings);
     }
 }
 
@@ -600,11 +746,11 @@ static void add_page(Site *site, Page *page, const File *file) {
         .output = JOIN(output_dir, S("/index.html")),
     };
     Value *v = page->values;
-    v[P_TITLE] = string(front.title);
-    v[P_URL] = string(JOIN(site->base, S("/"), output_dir, S("/")));
-    v[P_DATE] = string(front.date);
-    v[P_SUMMARY] = string(front.summary);
-    v[P_SLUG] = string(slug);
+    v[P_TITLE] = template_text(front.title);
+    v[P_URL] = template_text(JOIN(site->base, S("/"), output_dir, S("/")));
+    v[P_DATE] = literal_string(front.date);
+    v[P_SUMMARY] = template_text(front.summary);
+    v[P_SLUG] = literal_string(slug);
     set(&site->sources, file->path, page);
     PHASE_END(front_phase);
 }
@@ -690,9 +836,9 @@ static Str relative_path(Str dir, Str rel, char *storage, size capacity) {
     return (Str){out, bytes};
 }
 
-static Str link_target(void *context, Str target) {
+static Value link_target(void *context, Str target) {
     int first = at(target, 0);
-    if (first == '/' || first == '#' || scheme(target)) return target;
+    if (first == '/' || first == '#' || scheme(target)) return string(target);
     LinkContext *link = context;
     Site *site = link->site;
     if (!link->resolved) {
@@ -705,27 +851,27 @@ static Str link_target(void *context, Str target) {
         link->resolved = *slot;
     }
     // Successful links depend only on the directory and the target within a case.
-    Str *saved = get(link->resolved, target);
+    Value *saved = get(link->resolved, target);
     if (saved) return *saved;
     size hash = find_char(target, 0, '#');
     if (hash == NPOS) hash = target.n;
     Str frag = tail(target, hash);
     char path_bytes[256];
     Str path = relative_path(link->page->directory, slice(target, 0, hash), path_bytes, sizeof(path_bytes));
-    Str resolved = target;
+    Value resolved = string(target);
     if (path.p) {
         const Page *page = get(&site->sources, path);
-        if (page) resolved = frag.n ? JOIN(page->values[P_URL].text, frag) : page->values[P_URL].text;
-        else if (get(&site->statics, path)) resolved = JOIN(site->base, S("/"), path, frag);
+        if (page) resolved = frag.n ? template_text(JOIN(value_text(&page->values[P_URL]), frag)) : page->values[P_URL];
+        else if (get(&site->statics, path)) resolved = template_text(JOIN(site->base, S("/"), path, frag));
     }
-    if (resolved.p == target.p) {
+    if (resolved.bytes == target.p) {
         Str warning = JOIN(S("broken-link "), link->page->path, S(" -> "), target);
         if (!get(&site->broken, warning)) {
             set(&site->broken, warning, (void *)1);
             warn(site, warning);
         }
     } else {
-        saved = NEW(Str, 1);
+        saved = NEW(Value, 1);
         *saved = resolved;
         set(link->resolved, retain_link_key(target), saved);
     }
@@ -734,8 +880,8 @@ static Str link_target(void *context, Str target) {
 
 static int post_order(const void *a, const void *b) {
     const Page *x = a, *y = b;
-    int dates = compare(y->values[P_DATE].text, x->values[P_DATE].text);
-    return dates ? dates : compare(x->values[P_SLUG].text, y->values[P_SLUG].text);
+    int dates = compare(value_text(&y->values[P_DATE]), value_text(&x->values[P_DATE]));
+    return dates ? dates : compare(value_text(&x->values[P_SLUG]), value_text(&y->values[P_SLUG]));
 }
 
 static int tag_order(const void *a, const void *b) {
@@ -749,8 +895,8 @@ static TagEntry *make_tag(Site *site, Str name, Str slug, int post) {
     *tag = (TagEntry){
         .slug = slug,
         .values = {
-            [T_NAME] = string(name), [T_SLUG] = string(slug),
-            [T_URL] = string(post ? JOIN(site->base, S("/tags/"), slug, S("/")) : S("")),
+            [T_NAME] = template_text(name), [T_SLUG] = literal_string(slug),
+            [T_URL] = template_text(post ? JOIN(site->base, S("/tags/"), slug, S("/")) : S("")),
         },
     };
     tag->reference = record_values(TAG_FIELDS, tag->values, T_COUNT);
@@ -806,7 +952,7 @@ static Value page_tags(Site *site, Page *page) {
 
 static void card(Site *site, Page *page) {
     Value *v = page->values;
-    v[P_DATE_LONG] = string(long_date(v[P_DATE].text));
+    v[P_DATE_LONG] = literal_string(long_date(value_text(&v[P_DATE])));
     v[P_TAGS] = page_tags(site, page);
     v[P_IS_POST] = boolean(page->post);
     page->link = record_values(PAGE_FIELDS, v, P_SUMMARY);
@@ -924,9 +1070,13 @@ static void build_site(Buf *out, const Json *input) {
     if (per_page <= 0) fail();
     while (base.n && base.p[base.n - 1] == '/') base.n--;
 
+    Value title_value = template_text(title), base_value = template_text(base);
+    const Value *site_fields[] = {&title_value, &base_value};
+    Value site_value = record(SITE_FIELDS, site_fields, COUNT(site_fields));
+
     Site site = {.base = base};
     PHASE(TEMPLATES);
-    load_templates(&site, field(input, S("templates")));
+    load_templates(&site, field(input, S("templates")), &site_value);
     PHASE(FRONT);
     const Json *input_files = field(input, S("files"));
     if (input_files->kind != JARRAY) fail();
@@ -981,9 +1131,6 @@ static void build_site(Buf *out, const Json *input) {
     for (i = 0; i < page_count; i++)
         if (!pages[i].post) card(&site, &pages[i]);
 
-    Value title_value = string(title), base_value = string(base);
-    const Value *site_fields[] = {&title_value, &base_value};
-    Value site_value = record(SITE_FIELDS, site_fields, COUNT(site_fields));
     Value tags_value = collect_tags(&site);
     if (recent < 0) recent += (long)post_count;
     if (recent < 0) recent = 0;
@@ -1006,7 +1153,7 @@ static void build_site(Buf *out, const Json *input) {
         write_template(&site, out, p->output, p->layout, &root, &globals);
         if (pending) {
             // Listing templates use post cards, which retain the excerpt and minutes.
-            Str excerpt = p->post ? p->values[P_EXCERPT].text : (Str){0};
+            Str excerpt = p->post ? value_text(&p->values[P_EXCERPT]) : (Str){0};
             p->values[P_EXCERPT] = rendered(retain_html(mark, excerpt));
             p->values[P_CONTENT] = (Value){0};
             p->values[P_TOC] = (Value){0};
@@ -1035,6 +1182,7 @@ static void build_site(Buf *out, const Json *input) {
 void build_answers(Buf *out, char *source, size length) {
     // The encoding decision belongs to the entire batch. Keep escape detection
     // bounded to the input window, with five bytes retained between reads.
+    input_base = source;
     size first = length < INPUT_CHUNK ? length : INPUT_CHUNK;
     size overlap = 0;
     latin1 = 1;

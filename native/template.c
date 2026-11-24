@@ -1,14 +1,13 @@
 #include "core.h"
 
-enum NodeKind { END, TEXT, RAW, ESCAPED, TAG, FOR, IF, INCLUDE };
+enum NodeKind { END, TEXT, GLOBAL_RUN, RAW, ESCAPED, TAG, FOR, IF, INCLUDE };
 
 enum PathRoot { FREE_NAME, LOOP_ITEM, LOOP_INFO };
 typedef struct {
     Str name;
     enum Property *parts;
-    size n;
-    enum PathRoot root;
-    uint up;
+    uint n;
+    unsigned short root, up;
 } Path;
 struct Node {
     enum NodeKind kind;
@@ -123,7 +122,8 @@ Template parse_template(Str source) {
     if (tokens.error.n) return tokens;
 
     Template result = {0};
-    ParseFrame stack[129] = {{.next = &result.nodes}};
+    ParseFrame stack[129];
+    stack[0] = (ParseFrame){.next = &result.nodes};
     size depth = 0;
     for (Node *token = tokens.nodes; token;) {
         Node *node = token;
@@ -192,18 +192,66 @@ Template parse_template(Str source) {
 typedef struct Binding Binding;
 struct Binding { Str name; const Binding *outer; };
 
+typedef struct {
+    Str text;
+    const Op *last;
+} GlobalRun;
+
+static void write_value(Buf *out, const Value *v, int raw);
+
 struct Op {
     enum NodeKind kind;
-    int negate;
-    Str text;
+    union { int negate; enum NodeKind original_kind; };
     Path path;
-    const Op *body, *alternative;
-    Template *include;
+    union {
+        struct { Str text; const GlobalRun *run; };
+        Template *include;
+        struct {
+            const Op *body;
+            union { const Op *alternative; Str name; };
+        };
+    };
 };
+
+static const Value *site_path(const Op *op, const Value *site) {
+    if ((op->kind == RAW || op->kind == ESCAPED) &&
+        op->path.root == FREE_NAME && op->path.n == 2 && op->path.parts[0] == PROP_SITE)
+        return property(site, op->path.parts[1]);
+    return 0;
+}
+
+// Site settings are immutable. Merge their interpolations with neighboring
+// literals when a template runs outside any scope that could shadow "site".
+static void prepare_global_runs(Op *ops, const Value *site) {
+    for (Op *first = ops; first->kind != END;) {
+        Op *end = first;
+        int setting = 0;
+        for (;;) {
+            if (end->kind != TEXT) {
+                if (!site_path(end, site)) break;
+                setting = 1;
+            }
+            end++;
+        }
+        if (setting && end > first + 1) {
+            Buf text = {0};
+            for (Op *op = first; op < end; op++) {
+                if (op->kind == TEXT) append(&text, op->text);
+                else write_value(&text, site_path(op, site), op->kind == RAW);
+            }
+            GlobalRun *run = NEW(GlobalRun, 1);
+            *run = (GlobalRun){take(&text), end - 1};
+            first->original_kind = first->kind;
+            first->kind = GLOBAL_RUN;
+            first->run = run;
+        }
+        first = end == first ? end + 1 : end;
+    }
+}
 
 // Keep each branch contiguous and resolve lookups bound by loops in this
 // template. Includes can also inherit names from the calling scope.
-static Op *compile_nodes(const Node *nodes, const Map *templates, const Binding *bindings) {
+static Op *compile_nodes(const Node *nodes, const Map *templates, const Binding *bindings, const Value *site) {
     if (!nodes) return 0;
     size n = 0;
     for (const Node *node = nodes; node; node = node->next) n++;
@@ -211,7 +259,7 @@ static Op *compile_nodes(const Node *nodes, const Map *templates, const Binding 
     size i = 0;
     for (const Node *node = nodes; node; node = node->next, i++) {
         Op *op = &ops[i];
-        *op = (Op){.kind = node->kind, .text = node->text, .path = node->path, .negate = node->negate};
+        *op = (Op){.kind = node->kind, .path = node->path, .negate = node->negate};
         if (op->path.n) {
             for (const Binding *b = bindings; b; b = b->outer, op->path.up++) {
                 if (equal(op->path.name, S("loop"))) {
@@ -224,21 +272,24 @@ static Op *compile_nodes(const Node *nodes, const Map *templates, const Binding 
                 }
             }
         }
-        if (node->kind == INCLUDE) op->include = get(templates, node->text);
+        if (node->kind == TEXT) op->text = node->text;
+        else if (node->kind == INCLUDE) op->include = get(templates, node->text);
         else if (node->kind == FOR) {
+            op->name = node->text;
             Binding binding = {node->text, bindings};
-            op->body = compile_nodes(node->body, templates, &binding);
+            op->body = compile_nodes(node->body, templates, &binding, site);
         } else if (node->kind == IF) {
-            op->body = compile_nodes(node->body, templates, bindings);
-            op->alternative = compile_nodes(node->alternative, templates, bindings);
+            op->body = compile_nodes(node->body, templates, bindings, site);
+            op->alternative = compile_nodes(node->alternative, templates, bindings, site);
         }
     }
     ops[n].kind = END;
+    if (!bindings) prepare_global_runs(ops, site);
     return ops;
 }
 
-void prepare_template(Template *template, const Map *templates) {
-    template->ops = compile_nodes(template->nodes, templates, 0);
+void prepare_template(Template *template, const Map *templates, const Value *site) {
+    template->ops = compile_nodes(template->nodes, templates, 0, site);
 }
 
 typedef struct Scope Scope;
@@ -246,8 +297,8 @@ struct Scope {
     const Scope *parent;
     Str name;
     const Value *item, *loop;
-    const Value *root, *globals;
-    size root_names;
+    const Value *const *properties;
+    size root_names, start;
 };
 
 static const Value *lookup(const Scope *scope, const Path *path) {
@@ -267,8 +318,7 @@ static const Value *lookup(const Scope *scope, const Path *path) {
             }
             scope = scope->parent;
         }
-        v = property(scope->root, path->parts[0]);
-        if (!v) v = property(scope->globals, path->parts[0]);
+        v = scope->properties[path->parts[0]];
     }
 descend:
     for (size i = 1; v && i < path->n; i++) v = property(v, path->parts[i]);
@@ -279,10 +329,10 @@ static int truthy(const Value *v) {
     if (!v) return 0;
     switch (v->kind) {
         case NIL: return 0;
-        case STRING: return v->text.n != 0;
-        case RENDERED: return v->text.n != 0;
+        case STRING: case LITERAL_STRING: return v->n != 0;
+        case RENDERED: return v->n != 0;
         case NUMBER: case BOOLEAN: return v->number != 0;
-        case ARRAY: return v->array.n != 0;
+        case ARRAY: return v->n != 0;
         case RECORD: return 1;
     }
     return 0;
@@ -296,12 +346,15 @@ static void write_number(Buf *out, size value) {
 static void write_value(Buf *out, const Value *v, int raw) {
     if (!v) return;
     switch (v->kind) {
+        case LITERAL_STRING:
+            append(out, value_text(v));
+            break;
         case STRING:
-            json(out, v->text, !raw, !raw && !latin1);
+            json(out, value_text(v), !raw, !raw && !latin1);
             break;
         case RENDERED:
-            if (raw) append(out, v->text);
-            else escape_rendered(out, v->text);
+            if (raw) append(out, value_text(v));
+            else escape_rendered(out, value_text(v));
             break;
         case NUMBER:
             write_number(out, v->number);
@@ -310,9 +363,9 @@ static void write_value(Buf *out, const Value *v, int raw) {
             append(out, v->number ? S("true") : S("false"));
             break;
         case ARRAY:
-            for (size i = 0; i < v->array.n; i++) {
+            for (size i = 0; i < v->n; i++) {
                 if (i) ADD(out, ", ");
-                write_value(out, v->array.items[i], raw);
+                write_value(out, v->items[i], raw);
             }
             break;
         default:
@@ -330,6 +383,8 @@ struct Memo {
     size count, root_names;
     int disabled;
     Map by_item;
+    size local_scope, local_end;
+    size local_length;
 };
 _Static_assert(PROP_URL < 64, "template property mask");
 
@@ -357,7 +412,7 @@ static void collect_free(Memo *memo, const Op *ops, uint depth, const Binding *b
         --*budget;
         if (node->path.n) add_free_name(memo, node->path, bindings);
         if (node->kind == FOR) {
-            Binding binding = {node->text, bindings};
+            Binding binding = {node->name, bindings};
             collect_free(memo, node->body, depth, &binding, budget);
         } else if (node->kind == IF) {
             collect_free(memo, node->body, depth, bindings, budget);
@@ -382,7 +437,22 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
 
     const Value *item = 0;
     size binding_index = 0;
-    if (!scope->parent && (scope->root_names & memo->root_names)) goto uncached;
+    if (!scope->parent && (scope->root_names & memo->root_names)) {
+        // Root-dependent includes can still repeat within one page render.
+        if (memo->local_scope == scope->start && memo->local_end) {
+            Str saved = answer_fragment(out, memo->local_end - memo->local_length, memo->local_length);
+            if (saved.p) {
+                append(out, saved);
+                return;
+            }
+        }
+        size start = answer_position(out);
+        render_ops(out, template->ops, scope, depth, stack_depth);
+        memo->local_scope = scope->start;
+        memo->local_end = answer_position(out);
+        memo->local_length = memo->local_end - start;
+        return;
+    }
     for (size i = 0; scope->parent && i < memo->count; i++) {
         Str name = memo->names[i];
         const Scope *s = scope;
@@ -395,7 +465,7 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
             if (item) goto uncached;
             item = s->item;
             binding_index = i;
-        } else if (property(s->root, memo->properties[i])) {
+        } else if (s->root_names & (1UL << memo->properties[i])) {
             goto uncached;
         }
     }
@@ -434,16 +504,16 @@ uncached:
 static void render_loop(Buf *out, const Op *node, const Scope *scope, uint depth, uint stack_depth) {
     const Value *v = lookup(scope, &node->path);
     if (!v || v->kind != ARRAY || !node->body) return;
-    size count = v->array.n;
+    size count = v->n;
     Value index = numeric(0), first = boolean(0), last = boolean(0), length = numeric(count);
     const Value *fields[] = {&index, &first, &last, &length};
     Value loop = record(LOOP_FIELDS, fields, COUNT(fields));
-    Scope child = {.parent = scope, .name = node->text, .loop = &loop};
+    Scope child = {.parent = scope, .name = node->name, .loop = &loop};
     for (size i = 0; i < count; i++) {
         index.number = i + 1;
         first.number = i == 0;
         last.number = i + 1 == count;
-        child.item = v->array.items[i];
+        child.item = v->items[i];
         render_ops(out, node->body, &child, depth, stack_depth);
     }
 }
@@ -453,6 +523,16 @@ static void render_ops(Buf *out, const Op *ops, const Scope *scope, uint include
     if (stack_depth > 512) fail();
     for (const Op *node = ops; node->kind != END; node++) {
         switch (node->kind) {
+            case GLOBAL_RUN:
+                if (!scope->parent) {
+                    append(out, node->run->text);
+                    node = node->run->last;
+                } else if (node->original_kind == TEXT) {
+                    append(out, node->text);
+                } else {
+                    write_value(out, lookup(scope, &node->path), node->original_kind == RAW);
+                }
+                break;
             case TEXT:
                 append(out, node->text);
                 break;
@@ -478,14 +558,29 @@ static void render_ops(Buf *out, const Op *ops, const Scope *scope, uint include
 }
 
 void render_template(Buf *out, const Template *template, const Value *root, const Value *globals) {
-    Scope scope = {.root = root, .globals = globals};
+    const Value *properties[PROP_URL + 1] = {
+        [PROP_SITE] = globals->fields[0],
+        [PROP_TAGS] = globals->fields[1],
+        [PROP_RECENT] = globals->fields[2],
+    };
+    Scope scope = {.properties = properties, .start = answer_position(out)};
     if (root) {
-        static const size root_names[TAG_ROOT + 1] = {
-            [PAGE_ROOT] = 1UL << PROP_PAGE,
-            [TAG_ROOT] = 1UL << PROP_TAG,
-            [INDEX_FIELDS] = (1UL << PROP_POSTS) | (1UL << PROP_PAGER),
-        };
-        scope.root_names = root_names[root->record.layout];
+        switch (root->shape.layout) {
+            case PAGE_ROOT:
+                scope.root_names = 1UL << PROP_PAGE;
+                properties[PROP_PAGE] = root->fields[0];
+                break;
+            case TAG_ROOT:
+                scope.root_names = 1UL << PROP_TAG;
+                properties[PROP_TAG] = root->fields[0];
+                break;
+            case INDEX_FIELDS:
+                scope.root_names = (1UL << PROP_POSTS) | (1UL << PROP_PAGER);
+                properties[PROP_POSTS] = root->fields[0];
+                properties[PROP_PAGER] = root->fields[1];
+                break;
+            default: fail();
+        }
     }
     render_ops(out, template->ops, &scope, 0, 0);
 }
