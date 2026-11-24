@@ -328,7 +328,7 @@ struct Memo {
     Str names[8], constant;
     enum Property properties[8];
     size count, root_names;
-    int has_constant, disabled;
+    int disabled;
     Map by_item;
 };
 _Static_assert(PROP_URL < 64, "template property mask");
@@ -407,21 +407,23 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
             append(out, *saved);
             return;
         }
-        size start = out->n;
+        size start = answer_position(out);
         render_ops(out, template->ops, scope, depth, stack_depth);
-        Str *text = NEW(Str, 1);
-        *text = tail(take(out), start);
-        set(&memo->by_item, JOIN(key), text);
+        Str text = cache_answer(out, start);
+        if (text.p) {
+            Str *cached = NEW(Str, 1);
+            *cached = text;
+            set(&memo->by_item, JOIN(key), cached);
+        }
         return;
     }
-    if (memo->has_constant) {
+    if (memo->constant.p) {
         append(out, memo->constant);
         return;
     }
-    size start = out->n;
+    size start = answer_position(out);
     render_ops(out, template->ops, scope, depth, stack_depth);
-    memo->constant = tail(take(out), start);
-    memo->has_constant = 1;
+    memo->constant = cache_answer(out, start);
     return;
 
 uncached:

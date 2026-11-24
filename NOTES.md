@@ -178,3 +178,59 @@ The practice comparison used 41 interleaved runs per build and mode on CPU 7, re
 With THP disabled, the final native run incurred 406 fewer minor faults and used 1.307 ms less CPU. Its total process CPU was 7.964 ms above the kit null median. With THP enabled, the native median improved by 0.644 ms and the whole-process medians were within 0.110 ms. The gVisor score remains unmeasured.
 
 The wrapper source and binary, runner, baseline copy, profiled builds, and logs are in `/work/.tmp/t15`.
+
+### Streaming and resident pages (t16)
+
+- The addon renders into a reusable 64 KiB buffer. It opens `answers.json` on the first flush, holds the native writer lock through the last write, and truncates any stale tail. Symlinks and multiply linked files still use a sibling temporary file and rename. Include memoization copies up to 32 KiB of rendered text per case. Includes that cross a flush or exceed the cache budget render again on reuse.
+- Input reading, encoding detection, and each site's JSON parse, settings checks, and template compilation precede that site's output. A failure can still occur after output starts, for example when a later site has unsupported settings. Native failure closes the descriptor, unlinks any staging file, and returns to `main.ts`. The JavaScript driver opens the final file with `'w'` and rewrites the batch.
+- Page templates can read excerpts and reading times from the recent-post list, so those posts render their Markdown first. The other pages render Markdown immediately before their templates. The renderer keeps post excerpts for index and tag listings and reuses the rest of the HTML arena. Page records store their Markdown values directly, and hash table entries are 24 bytes each, down from 32.
+
+The I/O trials used 19 interleaved practice runs per variant on CPU 7 through `nothp`. These variants used the streamed writer before the Markdown and hash entry changes. The private file mappings were writable so the parser could keep decoding strings in place.
+
+| I/O trial | Native minor faults | Native CPU ms | Whole-process CPU ms, profiled |
+| --- | ---: | ---: | ---: |
+| HEAD with full answer buffer | 3,282 | 13.469 | 54.694 |
+| 64 KiB stream and populated read | 1,457 | 11.759 | 51.631 |
+| 256 KiB stream and populated read | 1,505 | 11.627 | 51.906 |
+| 1 MiB stream and populated read | 1,697 | 11.786 | 51.535 |
+| 64 KiB stream and lazy read | 1,457 | 11.917 | 51.968 |
+| 64 KiB stream and lazy private file mapping | 1,487 | 12.023 | 51.510 |
+| 64 KiB stream and populated private file mapping | 1,457 | 11.738 | 52.119 |
+
+The 64 KiB stream touched 48 fewer pages than the 256 KiB stream for an additional 0.132 ms of native CPU in the trial. The populated read and populated private mapping tied on faults and were within 0.021 ms of native CPU. The populated read had the lower measured process CPU of those two and avoids a mapped-file fault if the input shrinks.
+
+The following `mincore` counts are resident 4 KiB pages after a full run through `nothp`. The native fault count includes other regions such as code and the stack. The final addon's entire read-only data section is 24,924 bytes.
+
+| Build | Input pages | Per-case scratch pages | Rendered Markdown pages | Answer buffer pages | Native minor faults |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HEAD | 720 | 406 | 334 | 1,818 | 3,282 |
+| 64 KiB stream only | 720 | 382 | 334 | 16 | 1,457 |
+| Final | 720 | 348 | 26 | 16 | 1,116 |
+
+| Verification | Output |
+| --- | --- |
+| Original SHA-256 fuzz seeds 0–104 | 315 byte-identical sites, 0 JS fallbacks |
+| New SHA-256 fuzz seeds 105–204 | 300 byte-identical sites, 0 JS fallbacks |
+| Original seeds 0–34 through `nothp` | 105 byte-identical sites, 0 JS fallbacks |
+| `test.sh`, `test2.sh`, and `test3.sh` | 9, 16, and 8 lines beginning with `OK` |
+| `cases4` and `cases5` | 20 `OK` lines |
+| Forced early fallback, normal and `nothp` | 0 native bytes written, existing 12,000,000-byte file untouched until JS wrote 7,391,492 exact bytes |
+| Forced late fallback, normal and `nothp` | 1,441,792 exact native bytes observed before JS replaced the entire file with 7,362,887 exact bytes |
+| Other output checks | Exact 7,446,432-byte native overwrite, staged replacement of symlink and hardlink, and cleanup on forced staged failure |
+| Targeted `nothp` checks | Empty batch and four sites with oversized literals, nested includes, Markdown, statics, and varying recent counts. All exact, 0 JS fallbacks. |
+| ELF | No undefined symbols, `DT_NEEDED` entries, or symbol versions. GNU property reports `x86-64-baseline`. |
+
+The practice comparison used 41 interleaved runs per entry, build, and mode on CPU 7, reusing the output path. The native columns use `SITE_PROFILE` process fault deltas and native thread CPU. The whole-process columns use `wait4` with production binaries. The normal launch reported `THP_enabled: 1` and the wrapper reported `THP_enabled: 0`. Normal-mode fault counts varied between local runs even with THP enabled.
+
+| Entry | Mode | Native minor faults | Native CPU ms | Whole-process minor faults | Whole-process CPU ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| HEAD `3336fef` | Normal | 3,282 | 13.424 | 10,530 | 53.005 |
+| Final | Normal | 1,116 | 11.289 | 8,352 | 49.836 |
+| Kit null | Normal | — | — | 7,522 | 45.962 |
+| HEAD `3336fef` | THP disabled | 3,282 | 13.587 | 11,583 | 53.919 |
+| Final | THP disabled | 1,116 | 11.599 | 9,409 | 51.401 |
+| Kit null | THP disabled | — | — | 8,593 | 45.445 |
+
+With THP disabled, native minor faults fell by 2,166 (66%) and whole-process minor faults fell by 2,174. The process CPU median fell by 2.518 ms. The final process is 816 minor faults and 5.956 ms above the kit null median in this mode. Timings are local.
+
+The runner, trial builds, fixture and fuzz logs, fallback probes, and raw measurements are in `/work/.tmp/t16`. The final benchmark log is `final-41.log`.

@@ -26,13 +26,18 @@ void *alloc(size element, size count);
 void *zero(void *dst, size n);
 void copy(void *dst, const void *src, size n);
 char *grow(Buf *buf, size extra);
+void append_more(Buf *buf, Str str);
 static inline char *room(Buf *buf, size extra) {
     if (extra <= buf->cap - buf->n) return buf->p + buf->n;
     return grow(buf, extra);
 }
 static inline void append(Buf *buf, Str str) {
     if (!str.n) return;
-    copy(room(buf, str.n), str.p, str.n);
+    if (str.n > buf->cap - buf->n) {
+        append_more(buf, str);
+        return;
+    }
+    copy(buf->p + buf->n, str.p, str.n);
     buf->n += str.n;
 }
 static inline void put(Buf *buf, char c) {
@@ -41,6 +46,10 @@ static inline void put(Buf *buf, char c) {
 }
 Buf start_html(void);
 void finish_html(const Buf *out);
+size html_checkpoint(void);
+Str retain_html(size mark, Str text);
+size answer_position(const Buf *out);
+Str cache_answer(const Buf *out, size start);
 Str take(const Buf *buf);
 Str join(size count, const Str *parts);
 #define JOIN(...) join(COUNT(((Str[]){__VA_ARGS__})), (Str[]){__VA_ARGS__})
@@ -68,7 +77,7 @@ static inline uint first_bit(uint mask) {
     return index;
 }
 
-typedef struct { Str key; void *val; size hash; } Entry;
+typedef struct { const char *key; void *val; uint length, hash; } Entry;
 typedef struct { Entry *entries; size used, cap; } Map;
 void reserve_map(Map *map, size count);
 void *get(const Map *map, Str key);

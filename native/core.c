@@ -7,19 +7,33 @@
 #define ENV_WINDOW (2 * LARGE_PAGE)
 #define SCRATCH_LIMIT (256UL << 20)
 #define ALLOC_LIMIT (SCRATCH_LIMIT - 16)
-#define OUTPUT_LIMIT (128UL << 20)
+#ifndef SITE_OUTPUT_CAPACITY
+#define SITE_OUTPUT_CAPACITY (64UL << 10)
+#endif
+#define INCLUDE_CACHE_LIMIT (32UL << 10)
 #define HTML_LIMIT SCRATCH_LIMIT
-#define RESERVED_SIZE (LARGE_PAGE + ENV_WINDOW + SCRATCH_LIMIT + OUTPUT_LIMIT + HTML_LIMIT)
+#define RESERVED_SIZE (LARGE_PAGE + ENV_WINDOW + SCRATCH_LIMIT + HTML_LIMIT + SITE_OUTPUT_CAPACITY)
+
+_Static_assert(SCRATCH_LIMIT <= (uint)-1, "map key lengths fit in uint");
 
 typedef struct {
     char *base;
     size mapped;
 } Window;
 
-static Window scratch, output, html;
-static size used, html_used;
+static Window scratch, html;
+static size used, html_used, include_cache_used;
+static Buf answer;
+static struct {
+    Str path;
+    long fd;
+    size written, old_length;
+    char temporary[PATH_LIMIT + 32];
+} stream;
 static void *failure[5];
 int latin1;
+
+static void flush_answer(void);
 
 enum LinuxCall {
     SYS_READ = 0, SYS_WRITE = 1, SYS_OPEN = 2, SYS_CLOSE = 3, SYS_FSTAT = 5,
@@ -145,13 +159,13 @@ __attribute__((used, externally_visible)) void *memset(void *d, int c, size n) {
 }
 
 char *grow(Buf *buf, size extra) {
+    if (buf == &answer) {
+        if (extra > buf->cap) fail();
+        flush_answer();
+        return buf->p;
+    }
     if (extra > SCRATCH_LIMIT - buf->n) fail();
     size need = buf->n + extra;
-    if (buf->p == output.base) {
-        if (need > OUTPUT_LIMIT || !fit(&output, need, OUTPUT_LIMIT)) fail();
-        buf->cap = output.mapped;
-        return buf->p + buf->n;
-    }
     if (buf->p == html.base + html_used) {
         if (need > HTML_LIMIT - html_used || !fit(&html, html_used + need, HTML_LIMIT)) fail();
         buf->cap = html.mapped - html_used;
@@ -170,6 +184,31 @@ char *grow(Buf *buf, size extra) {
     }
     buf->cap = cap;
     return buf->p + buf->n;
+}
+
+void append_more(Buf *buf, Str str) {
+    if (buf == &answer) {
+        while (str.n > buf->cap - buf->n) {
+            size filled = buf->cap - buf->n;
+            copy(buf->p + buf->n, str.p, filled);
+            buf->n = buf->cap;
+            flush_answer();
+            str = tail(str, filled);
+        }
+    }
+    copy(room(buf, str.n), str.p, str.n);
+    buf->n += str.n;
+}
+
+size answer_position(const Buf *out) { return stream.written + out->n; }
+
+Str cache_answer(const Buf *out, size start) {
+    // A flush may have overwritten the beginning of this include.
+    if (start < stream.written) return (Str){0};
+    Str text = tail(take(out), start - stream.written);
+    if (text.n > INCLUDE_CACHE_LIMIT - include_cache_used) return (Str){0};
+    include_cache_used += text.n;
+    return text.n ? JOIN(text) : S("");
 }
 
 Str take(const Buf *buf) { return (Str){buf->p, buf->n}; }
@@ -240,21 +279,21 @@ size find_str(Str s, size pos, Str needle) {
     return NPOS;
 }
 
-static size hash(Str s) {
+static uint hash(Str s) {
     size h = 0x84222325cbf29ce4UL;
     size i = 0;
     for (; s.n - i >= 8; i += 8) h = (h ^ (size)*(const Word *)(s.p + i)) * 0x100000001b3UL;
     for (; i < s.n; i++) h = (h ^ (byte)s.p[i]) * 0x100000001b3UL;
-    h ^= h >> 32;
-    return h ? h : 1;
+    uint folded = h ^ (h >> 32);
+    return folded ? folded : 1;
 }
 
-static Entry *slot(const Map *map, Str key, size h) {
+static Entry *slot(const Map *map, Str key, uint h) {
     size mask = map->cap - 1;
     size i = h & mask;
     while (map->entries[i].hash) {
         Entry *e = &map->entries[i];
-        if (e->hash == h && equal(key, e->key)) return e;
+        if (e->hash == h && equal(key, (Str){e->key, e->length})) return e;
         i = (i + 1) & mask;
     }
     return &map->entries[i];
@@ -274,13 +313,14 @@ void reserve_map(Map *map, size count) {
     Map old = *map;
     map->cap = cap;
     map->entries = entries;
-    for (size i = 0; i < old.cap; i++)
-        if (old.entries[i].hash)
-            *slot(map, old.entries[i].key, old.entries[i].hash) = old.entries[i];
+    for (size i = 0; i < old.cap; i++) {
+        const Entry *e = &old.entries[i];
+        if (e->hash) *slot(map, (Str){e->key, e->length}, e->hash) = *e;
+    }
 }
 
 void **entry_value(Map *map, Str key) {
-    size h = hash(key);
+    uint h = hash(key);
     if (!map->cap) reserve_map(map, 1);
     Entry *e = slot(map, key, h);
     if (!e->hash) {
@@ -289,7 +329,7 @@ void **entry_value(Map *map, Str key) {
             e = slot(map, key, h);
         }
         map->used++;
-        *e = (Entry){key, 0, h};
+        *e = (Entry){key.p, 0, key.n, h};
     }
     return &e->val;
 }
@@ -324,12 +364,21 @@ size checkpoint(void) { return used; }
 void rewind_arena(size mark) {
     used = mark;
     html_used = 0;
+    include_cache_used = 0;
 }
 
 // Heading labels and excerpts keep slices of this buffer, so growth must preserve
 // its address. Commit only the bytes rendered before starting another page.
 Buf start_html(void) { return (Buf){html.base + html_used, 0, html.mapped - html_used}; }
 void finish_html(const Buf *out) { html_used += round_up(out->n, 8); }
+size html_checkpoint(void) { return html_used; }
+
+Str retain_html(size mark, Str text) {
+    char *dst = html.base + mark;
+    if (text.n && dst != text.p) copy(dst, text.p, text.n);
+    html_used = mark + round_up(text.n, 8);
+    return (Str){dst, text.n};
+}
 
 static int read_file(long fd, char *bytes, size count) {
     while (count) {
@@ -429,59 +478,79 @@ static void paths(Str *input, Str *output) {
     *output = (Str){output_path, output_size};
 }
 
-static int write_answer(long fd, const Buf *out) {
-    PHASE(WRITE);
-    size pos = 0;
-    while (pos < out->n) {
-        size count = out->n - pos;
-        long wrote = sys3(SYS_WRITE, fd, (long)(out->p + pos), count);
-        if (wrote == -4) continue;
-        if (wrote <= 0) return 0;
-        pos += wrote;
-    }
-    return 1;
-}
-
-static int publish_temporary(Str path, const Buf *out) {
-    PHASE(OPEN_OUTPUT);
-    Str temporary = JOIN(slice(path, 0, path.n - 1), S(".native-"),
-                         number(sys3(SYS_GETPID, 0, 0, 0)), S("\0"));
-    long fd = open_file(temporary.p, 1 | 64 | 128, 0666);  // O_WRONLY | O_CREAT | O_EXCL
-    if (fd < 0) return 0;
-    int written = write_answer(fd, out);
-    PHASE(CLOSE_OUTPUT);
-    int closed = close_file(fd) == 0;
-    PHASE(RENAME_OUTPUT);
-    if (closed && written && sys3(SYS_RENAME, (long)temporary.p, (long)path.p, 0) == 0) return 1;
-    sys3(SYS_UNLINK, (long)temporary.p, 0, 0);
-    return 0;
-}
-
-static int publish(Str path, const Buf *out) {
-    PHASE(OPEN_OUTPUT);
+static long open_direct_answer(void) {
     // Serialize native writers and reuse the existing regular file's cached pages.
-    // Keep replacement semantics for symlinks and other nonregular paths.
-    long fd = open_file(path.p, 1 | 64 | 2048 | 131072, 0666);  // O_WRONLY | O_CREAT | O_NONBLOCK | O_NOFOLLOW
-    if (fd < 0) return publish_temporary(path, out);
+    long fd = open_file(stream.path.p, 1 | 64 | 2048 | 131072, 0666);  // O_WRONLY | O_CREAT | O_NONBLOCK | O_NOFOLLOW
+    if (fd < 0) return fd;
     FileStatus info;
     if (sys3(SYS_FSTAT, fd, (long)&info, 0) < 0 || (info.mode & 0170000) != 0100000 || info.nlink != 1) {
         close_file(fd);
-        return publish_temporary(path, out);
+        return -1;
     }
     long locked;
     do locked = sys3(SYS_FLOCK, fd, 2, 0); while (locked == -4);  // LOCK_EX
     // Another native writer can change the size before this writer gets the lock.
     if (locked < 0 || sys3(SYS_FSTAT, fd, (long)&info, 0) < 0 || info.nlink != 1) {
         close_file(fd);
-        return publish_temporary(path, out);
+        return -1;
     }
+    stream.old_length = info.length;
+    return fd;
+}
 
-    int ok = write_answer(fd, out);
-    PHASE(TRUNCATE_OUTPUT);
-    if (ok && (size)info.length > out->n)
-        ok = sys3(SYS_FTRUNCATE, fd, out->n, 0) == 0;
+static void open_answer(void) {
+    PHASE_BEGIN(previous, OPEN_OUTPUT);
+    stream.fd = open_direct_answer();
+    if (stream.fd < 0) {
+        // Keep replacement semantics for symlinks and multiply linked files.
+        size n = stream.path.n - 1;
+        Str suffix = S(".native-");
+        char digits[20];
+        Str pid = format_number(digits + sizeof(digits), sys3(SYS_GETPID, 0, 0, 0));
+        copy(stream.temporary, stream.path.p, n);
+        copy(stream.temporary + n, suffix.p, suffix.n);
+        copy(stream.temporary + n + suffix.n, pid.p, pid.n);
+        stream.temporary[n + suffix.n + pid.n] = 0;
+        stream.fd = open_file(stream.temporary, 1 | 64 | 128, 0666);  // O_WRONLY | O_CREAT | O_EXCL
+        if (stream.fd < 0) {
+            stream.temporary[0] = 0;
+            fail();
+        }
+    }
+    PHASE_END(previous);
+}
+
+static void flush_answer(void) {
+    if (!answer.n) return;
+    if (stream.fd < 0) open_answer();
+    PHASE_BEGIN(previous, WRITE);
+    size pos = 0;
+    while (pos < answer.n) {
+        long wrote = sys3(SYS_WRITE, stream.fd, (long)(answer.p + pos), answer.n - pos);
+        if (wrote == -4) continue;
+        if (wrote <= 0) fail();
+        pos += wrote;
+    }
+    stream.written += answer.n;
+    answer.n = 0;
+    PHASE_END(previous);
+}
+
+static void finish_answer(void) {
+    flush_answer();
+    if (stream.old_length > stream.written) {
+        PHASE(TRUNCATE_OUTPUT);
+        if (sys3(SYS_FTRUNCATE, stream.fd, stream.written, 0) != 0) fail();
+    }
     PHASE(CLOSE_OUTPUT);
-    return close_file(fd) == 0 && ok;
+    long closed = close_file(stream.fd);
+    stream.fd = -1;
+    if (closed != 0) fail();
+    if (stream.temporary[0]) {
+        PHASE(RENAME_OUTPUT);
+        if (sys3(SYS_RENAME, (long)stream.temporary, (long)stream.path.p, 0) != 0) fail();
+        stream.temporary[0] = 0;
+    }
 }
 
 #ifdef SITE_PROFILE
@@ -577,18 +646,16 @@ static void profile_finish(void) {
 #endif
 
 static void job(void) {
-    Str input, output_path;
-    paths(&input, &output_path);
+    Str input;
+    paths(&input, &stream.path);
     PHASE(INPUT);
     Str source = read_input(input.p);
     size alignment = source.n >= (1UL << 20) ? LARGE_PAGE : PAGE_SIZE;
-    size output_size = round_up(source.n * 3 + 65536, alignment);
     size html_size = round_up(source.n + 65536, alignment);
-    if (!extend(&output, output_size < OUTPUT_LIMIT ? output_size : OUTPUT_LIMIT, 0) ||
-        !extend(&html, html_size < HTML_LIMIT ? html_size : HTML_LIMIT, 0)) fail();
-    Buf answer = {output.base, 0, output.mapped};
+    if (!extend(&html, html_size < HTML_LIMIT ? html_size : HTML_LIMIT, 0) ||
+        sys3(SYS_MPROTECT, (long)answer.p, answer.cap, 3) < 0) fail();
     build_answers(&answer, source);
-    if (!publish(output_path, &answer)) fail();
+    finish_answer();
 #ifdef SITE_PROFILE
     profile_finish();
 #endif
@@ -606,10 +673,16 @@ void *napi_register_module_v1(void *env, void *exports) {
     long address = map_memory(0, RESERVED_SIZE, 0, MAP_PRIVATE | MAP_ANONYMOUS);
     if ((size)address >= (size)-4095) return exports;
     scratch = (Window){(char *)round_up(address, LARGE_PAGE) + ENV_WINDOW, 0};
-    output = (Window){scratch.base + SCRATCH_LIMIT, 0};
-    html = (Window){output.base + OUTPUT_LIMIT, 0};
-    used = html_used = 0;
+    html = (Window){scratch.base + SCRATCH_LIMIT, 0};
+    answer = (Buf){html.base + HTML_LIMIT, 0, SITE_OUTPUT_CAPACITY};
+    used = html_used = include_cache_used = 0;
+    stream.fd = -1;
+    stream.written = stream.old_length = 0;
+    stream.temporary[0] = 0;
     if (!__builtin_setjmp(failure)) job();
+    // Returning from registration runs the JS driver, which truncates any partial answer.
+    if (stream.fd >= 0) close_file(stream.fd);
+    if (stream.temporary[0]) sys3(SYS_UNLINK, (long)stream.temporary, 0, 0);
     sys3(SYS_MUNMAP, address, RESERVED_SIZE, 0);
     return exports;
 }

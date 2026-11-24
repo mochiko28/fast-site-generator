@@ -258,7 +258,6 @@ struct Page {
     Front front;
     const Template *layout;
     int post;
-    Markdown md;
     Value card, link, data;
     const Value *fields[14];
     Value values[14];
@@ -725,17 +724,25 @@ static void card(Site *site, Page *page) {
     v[P_DATE] = string(page->front.date);
     v[P_DATE_LONG] = string(long_date(page->front.date));
     v[P_SUMMARY] = string(page->front.summary);
-    v[P_EXCERPT] = page->md.excerpt;
-    v[P_MINUTES] = numeric(page->md.minutes);
     v[P_TAGS] = page_tags(site, page);
     v[P_SLUG] = string(page->slug);
-    v[P_CONTENT] = page->md.html;
-    v[P_TOC] = page->md.toc;
     v[P_IS_POST] = boolean(page->post);
     for (size i = 0; i < P_FIELDS; i++) page->fields[i] = &v[i];
     page->link = record(PAGE_FIELDS, page->fields, P_SUMMARY);
     page->card = record(PAGE_FIELDS, page->fields, P_SLUG);
     page->data = record(PAGE_FIELDS, page->fields, P_FIELDS);
+}
+
+static void render_markdown(Site *site, Page *page) {
+    PHASE_BEGIN(previous, MARKDOWN);
+    LinkContext context = {.site = site, .page = page};
+    Markdown md = markdown(page->front.body, link_target, &context);
+    Value *v = page->values;
+    v[P_EXCERPT] = md.excerpt;
+    v[P_MINUTES] = numeric(md.minutes);
+    v[P_CONTENT] = md.html;
+    v[P_TOC] = md.toc;
+    PHASE_END(previous);
 }
 
 static Value collect_tags(Site *site) {
@@ -880,13 +887,6 @@ static void build_site(Buf *out, const Json *input) {
         }
     }
 
-    PHASE(MARKDOWN);
-    for (i = 0; i < page_count; i++) {
-        LinkContext context = {.site = &site, .page = &pages[i]};
-        pages[i].md = markdown(pages[i].front.body, link_target, &context);
-    }
-
-    PHASE(FRONT);
     sort((void **)posts, post_count, post_order);
     const Value **cards = NEW(const Value *, post_count);
     for (i = 0; i < post_count; i++) {
@@ -907,6 +907,8 @@ static void build_site(Buf *out, const Json *input) {
     if (recent < 0) recent += (long)post_count;
     if (recent < 0) recent = 0;
     if ((size)recent > post_count) recent = post_count;
+    // Page templates can read the excerpts and reading times of recent posts.
+    for (i = 0; i < (size)recent; i++) render_markdown(&site, posts[i]);
     Value recent_value = array(cards, recent);
     const Value *global_fields[] = {&site_value, &tags_value, &recent_value};
     Value globals = record(GLOBAL_FIELDS, global_fields, COUNT(global_fields));
@@ -915,9 +917,19 @@ static void build_site(Buf *out, const Json *input) {
     put(out, '{');
     for (i = 0; i < page_count; i++) {
         Page *p = &pages[i];
+        int pending = p->values[P_CONTENT].kind == NIL;
+        size mark = html_checkpoint();
+        if (pending) render_markdown(&site, p);
         const Value *local = &p->data;
         Value root = record(PAGE_ROOT, &local, 1);
         write_template(&site, out, p->output, p->layout, &root, &globals);
+        if (pending) {
+            // Listing templates use post cards, which retain the excerpt and minutes.
+            Str excerpt = p->post ? p->values[P_EXCERPT].text : (Str){0};
+            p->values[P_EXCERPT] = rendered(retain_html(mark, excerpt));
+            p->values[P_CONTENT] = (Value){0};
+            p->values[P_TOC] = (Value){0};
+        }
     }
     const Template *index = get(&site.templates, S("index"));
     if (index) write_indexes(&site, out, index, &globals, cards, post_count, per_page);
