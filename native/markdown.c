@@ -12,9 +12,45 @@ static int escapable(int c) {
     }
 }
 
-static size closer(Str s, size from, Str mark, int single_star) {
-    for (size i = from; (i = find_char(s, i, mark.p[0])) != NPOS; i++) {
-        if (!starts(tail(s, i), mark)) continue;
+typedef struct { char text[8]; byte length; } Entity;
+static const Entity escapes[64] = {
+    ['&'] = {"&amp;", 5}, ['<'] = {"&lt;", 4}, ['>'] = {"&gt;", 4},
+    ['"'] = {"&quot;", 6}, ['\''] = {"&#39;", 5},
+};
+
+enum InlineMark { PLAIN, ENTITY, CONTROL, BACKSLASH, BACKTICK, STAR, LABEL, SURROGATE };
+static const byte inline_class[256] = {
+    [0 ... 31] = CONTROL, ['&'] = ENTITY, ['<'] = ENTITY, ['>'] = ENTITY,
+    ['"'] = ENTITY, ['\''] = ENTITY, ['\\'] = BACKSLASH, ['\x60'] = BACKTICK,
+    ['*'] = STAR, ['['] = LABEL, [0xed] = SURROGATE,
+};
+
+static inline uint marks(Vec bytes, Vec surrogate) {
+    // The grouped byte tests include a few plain bytes, handled by inline_class.
+    Vec hits = ((bytes ^ SPLAT(-128)) < SPLAT(-96)) |
+        ((bytes & SPLAT((char)0xfa)) == SPLAT('"')) |
+        ((bytes & SPLAT((char)0x9d)) == SPLAT(0x1c)) |
+        (bytes == SPLAT('[')) | (bytes == SPLAT('*')) |
+        (bytes == SPLAT('\x60')) | (bytes == surrogate);
+    return __builtin_ia32_pmovmskb128(hits);
+}
+
+static inline size arena_char(Str s, size from, char c) {
+    Vec needle = SPLAT(c);
+    while (from < s.n) {
+        uint bits = __builtin_ia32_pmovmskb128(*(const Vec *)(s.p + from) == needle);
+        if (bits) {
+            size pos = from + first_bit(bits);
+            return pos < s.n ? pos : NPOS;
+        }
+        from += 16;
+    }
+    return NPOS;
+}
+
+static size closer(Str s, size from, char c, int strong, int single_star) {
+    for (size i = from; (i = arena_char(s, i, c)) != NPOS; i++) {
+        if (strong && at(s, i + 1) != c) continue;
         size slash = i;
         while (slash > from && s.p[slash - 1] == '\\') slash--;
         if ((i - slash) & 1) continue;
@@ -24,118 +60,132 @@ static size closer(Str s, size from, Str mark, int single_star) {
     return NPOS;
 }
 
-static const Str escapes[64] = {
-    ['&'] = S("&amp;"), ['<'] = S("&lt;"), ['>'] = S("&gt;"), ['"'] = S("&quot;"), ['\''] = S("&#39;"),
-};
-
-static uint marks(Vec bytes) {
-    Vec hit =
-        (bytes == SPLAT('\\')) | (bytes == SPLAT('`')) | (bytes == SPLAT('*')) | (bytes == SPLAT('[')) |
-        (bytes == SPLAT('&')) | (bytes == SPLAT('<')) | (bytes == SPLAT('>')) |
-        (bytes == SPLAT('"')) | (bytes == SPLAT('\'')) |
-        ((bytes ^ SPLAT(-128)) < SPLAT(-96));
-    if (!latin1) hit |= bytes == SPLAT((char)0xed);
-    return __builtin_ia32_pmovmskb128(hit);
-}
-
-// Copy plain runs as they are scanned. A vector store can include the mark
-// and bytes past it, which the following token overwrites as needed.
-static size copy_inline_text(Buf *out, Str s, size i) {
-    size from = i;
-    char *dst = room(out, s.n - i);
-    for (; s.n - i >= 16; i += 16) {
-        Vec bytes = *(const Vec *)(s.p + i);
-        *(Vec *)(dst + i - from) = bytes;
-        uint hit = marks(bytes);
-        if (hit) {
-            i += first_bit(hit);
-            out->n += i - from;
-            return i;
-        }
-    }
-    if (i < s.n) {
-        // A Markdown slice has a readable SIMD tail in the arena.
-        uint hit = marks(*(const Vec *)(s.p + i)) & ((1u << (s.n - i)) - 1);
-        size n = hit ? (size)first_bit(hit) : s.n - i;
-        copy(dst + i - from, s.p + i, n);
-        i += n;
-    }
-    out->n += i - from;
-    return i;
-}
-
 static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uint depth) {
+    if (!s.n) return;
     if (depth > 128) fail();
+    Vec surrogate = SPLAT(latin1 ? 0 : (char)0xed);
     int labels = 1;
-    for (size i = 0; i < s.n && (i = copy_inline_text(out, s, i)) < s.n;) {
+    size i = 0;
+    char *dst = room(out, s.n * 6 + 16);
+    while (i < s.n) {
+        // Both slices have space for a vector at the end. A later token replaces
+        // any speculatively copied bytes beyond the current plain text.
+        Vec bytes = *(const Vec *)(s.p + i);
+        *(Vec *)dst = bytes;
+        uint hits = marks(bytes, surrogate);
+        size plain = hits ? first_bit(hits) : 16;
+        if (plain >= s.n - i) {
+            dst += s.n - i;
+            break;
+        }
+        i += plain;
+        dst += plain;
+        if (!hits) continue;
+
         unsigned c = (byte)s.p[i];
         size next = i + 1;
-        if (c == '\n') {
-            ADD(out, "\\n");
-        } else if (c < COUNT(escapes) && escapes[c].n) {
-            append(out, escapes[c]);
-        } else if (c <= 31) {
-            json_ascii(out, c);
-        } else if (c == '\\') {
-            c = at(s, next);
-            if (!escapable(c)) ADD(out, "\\\\");
-            else {
-                next++;
-                if (c == '>') ADD(out, "&gt;");
-                else if (c == '\\') ADD(out, "\\\\");
-                else put(out, c);
+        switch (inline_class[c]) {
+            case ENTITY: {
+                const Entity *entity = &escapes[c];
+                __builtin_memcpy(dst, entity->text, sizeof(entity->text));
+                dst += entity->length;
+                break;
             }
-        } else if (c == '`') {
-            size end = find_char(s, next, '`');
-            if (end == NPOS || end == next) goto literal;
-            ADD(out, "<code>");
-            json(out, slice(s, next, end), 1, 0);
-            ADD(out, "</code>");
-            next = end + 1;
-        } else if (c == '*') {
-            int strong = at(s, next) == '*';
-            next += strong;
-            size end = closer(s, next, strong ? S("**") : S("*"), !strong);
-            if (end == NPOS || end == next) {
-                put(out, '*');
-                if (strong) put(out, '*');
-                i = next;
-                continue;
+            case CONTROL:
+                if (c == '\n') {
+                    *dst++ = '\\';
+                    *dst++ = 'n';
+                } else {
+                    out->n = dst - out->p;
+                    json_ascii(out, c);
+                    dst = out->p + out->n;
+                }
+                break;
+            case BACKSLASH:
+                c = at(s, next);
+                if (!escapable(c)) {
+                    *dst++ = '\\';
+                    *dst++ = '\\';
+                } else {
+                    next++;
+                    if (c == '>') {
+                        __builtin_memcpy(dst, "&gt;", 4);
+                        dst += 4;
+                    } else {
+                        if (c == '\\') *dst++ = '\\';
+                        *dst++ = c;
+                    }
+                }
+                break;
+            case BACKTICK: {
+                size end = arena_char(s, next, '\x60');
+                if (end == NPOS || end == next) goto literal;
+                out->n = dst - out->p;
+                ADD(out, "<code>");
+                json(out, slice(s, next, end), 1, 0);
+                ADD(out, "</code>");
+                next = end + 1;
+                dst = room(out, (s.n - next) * 6 + 16);
+                break;
             }
-            append(out, strong ? S("<strong>") : S("<em>"));
-            inline_html(out, slice(s, next, end), resolve, context, depth + 1);
-            append(out, strong ? S("</strong>") : S("</em>"));
-            next = end + 1 + strong;
-        } else if (c == '[' && labels) {
-            size label_end = closer(s, next, S("]"), 0);
-            if (label_end == NPOS) {
-                labels = 0;
-                goto literal;
+            case STAR: {
+                int strong = at(s, next) == '*';
+                next += strong;
+                size end = closer(s, next, '*', strong, !strong);
+                if (end == NPOS || end == next) {
+                    *dst++ = '*';
+                    if (strong) *dst++ = '*';
+                    break;
+                }
+                out->n = dst - out->p;
+                append(out, strong ? S("<strong>") : S("<em>"));
+                inline_html(out, slice(s, next, end), resolve, context, depth + 1);
+                append(out, strong ? S("</strong>") : S("</em>"));
+                next = end + 1 + strong;
+                dst = room(out, (s.n - next) * 6 + 16);
+                break;
             }
-            if (at(s, label_end + 1) != '(') goto literal;
-            size end = find_char(s, label_end + 2, ')');
-            if (end == NPOS || end == label_end + 2) goto literal;
-            Str target = slice(s, label_end + 2, end);
-            if (has_space(target)) goto literal;
-            Str href = resolve(context, target);
-            ADD(out, "<a href=\\\"");
-            json(out, href, 1, 0);
-            ADD(out, "\\\">");
-            inline_html(out, slice(s, next, label_end), resolve, context, depth + 1);
-            ADD(out, "</a>");
-            next = end + 1;
-        } else if (c == 0xed && !latin1) {
-            next = i;
-            uint cp = decode(s, &next);
-            if (cp < 0xd800 || cp > 0xdfff) goto literal;
-            json_code_unit(out, cp);
-        } else {
+            case LABEL: {
+                if (!labels) goto literal;
+                size label_end = closer(s, next, ']', 0, 0);
+                if (label_end == NPOS) {
+                    labels = 0;
+                    goto literal;
+                }
+                if (at(s, label_end + 1) != '(') goto literal;
+                size end = arena_char(s, label_end + 2, ')');
+                if (end == NPOS || end == label_end + 2) goto literal;
+                Str target = slice(s, label_end + 2, end);
+                if (has_space(target)) goto literal;
+                Str href = resolve(context, target);
+                out->n = dst - out->p;
+                ADD(out, "<a href=\\\"");
+                json(out, href, 1, 0);
+                ADD(out, "\\\">");
+                inline_html(out, slice(s, next, label_end), resolve, context, depth + 1);
+                ADD(out, "</a>");
+                next = end + 1;
+                dst = room(out, (s.n - next) * 6 + 16);
+                break;
+            }
+            case SURROGATE: {
+                next = i;
+                uint cp = decode(s, &next);
+                if (cp < 0xd800 || cp > 0xdfff) goto literal;
+                out->n = dst - out->p;
+                json_code_unit(out, cp);
+                dst = out->p + out->n;
+                break;
+            }
+            case PLAIN:
 literal:
-            put(out, s.p[i]);
-            next = i + 1;
+                *dst++ = s.p[i];
+                next = i + 1;
+                break;
         }
         i = next;
     }
+    out->n = dst - out->p;
 }
 
 enum Block { PARAGRAPH, FENCE = 7, BREAK, BLANK };
@@ -183,19 +233,56 @@ static int continued(Str line) {
 typedef struct {
     Str body, line;
     size at, end, next;
-    uint *ends;
-    size count, cap;
+    size words;
+    uint breaks, preceding_gap, carry;
 } Lines;
 
-static void add_line_end(Lines *lines, size end) {
-    if (lines->count == lines->cap) {
-        size cap = lines->cap * 2;
-        uint *ends = NEW(uint, cap);
-        copy(ends, lines->ends, lines->count * sizeof(*ends));
-        lines->ends = ends;
-        lines->cap = cap;
+// Count word starts from the two bytes of a SIMD mask on baseline x86-64.
+#define POP2(n) n, n + 1, n + 1, n + 2
+#define POP4(n) POP2(n), POP2(n + 1), POP2(n + 1), POP2(n + 2)
+#define POP6(n) POP4(n), POP4(n + 1), POP4(n + 1), POP4(n + 2)
+static const byte popcounts[] = {POP6(0), POP6(1), POP6(1), POP6(2)};
+#undef POP6
+#undef POP4
+#undef POP2
+
+static uint bit_count(uint bits) {
+    return popcounts[bits & 255] + popcounts[bits >> 8];
+}
+
+// A vector may contain several lines. Keep its remaining breaks for advance()
+// and count word starts when loading the vector.
+static size scan_line_end(Lines *lines) {
+    Str body = lines->body;
+    while (!lines->breaks) {
+        size i = lines->next;
+        if (i >= body.n) return body.n;
+        Vec w = *(const Vec *)(body.p + i);
+        uint valid = body.n - i >= 16 ? 0xffff : (1u << (body.n - i)) - 1;
+        lines->next += 16;
+        lines->breaks = __builtin_ia32_pmovmskb128(w == SPLAT('\n')) & valid;
+        if (body.n > 400) {
+            Vec ws = (w == SPLAT(' ')) | ((w > SPLAT(8)) & (w < SPLAT(14)));
+            uint gaps = lines->carry | (uint)__builtin_ia32_pmovmskb128(ws);
+            if (__builtin_ia32_pmovmskb128(w)) {
+                // These are the five UTF-8 lead bytes that can start JS whitespace.
+                uint leads = __builtin_ia32_pmovmskb128(
+                    (w == SPLAT((char)0xc2)) | (w == SPLAT((char)0xe1)) | (w == SPLAT((char)0xe2)) |
+                    (w == SPLAT((char)0xe3)) | (w == SPLAT((char)0xef))) & valid;
+                for (; leads; leads &= leads - 1) {
+                    uint j = first_bit(leads);
+                    size width = space_width(body, i + j);
+                    gaps |= ((1u << width) - 1) << j;
+                }
+            }
+            lines->words += bit_count(~gaps & ((gaps << 1) | lines->preceding_gap) & valid);
+            lines->preceding_gap = (gaps >> 15) & 1;
+            lines->carry = gaps >> 16;
+        }
     }
-    lines->ends[lines->count++] = end;
+    size end = lines->next - 16 + first_bit(lines->breaks);
+    lines->breaks &= lines->breaks - 1;
+    return end;
 }
 
 static void advance(Lines *lines) {
@@ -204,7 +291,7 @@ static void advance(Lines *lines) {
         lines->line = (Str){0};
         return;
     }
-    lines->end = lines->ends[lines->next++];
+    lines->end = scan_line_end(lines);
     lines->line = slice(lines->body, lines->at, lines->end);
 }
 
@@ -304,76 +391,18 @@ static Str paragraph(Lines *lines, int *kind) {
     return take(&text);
 }
 
-static uint bit_count(uint bits) {
-    bits -= (bits >> 1) & 0x5555;
-    bits = (bits & 0x3333) + ((bits >> 2) & 0x3333);
-    bits = (bits + (bits >> 4)) & 0x0f0f;
-    return (bits + (bits >> 8)) & 31;
-}
-
-// Index line boundaries and count word starts in the same pass.
-static size index_lines(Lines *lines) {
-    Str body = lines->body;
-    int count_words = body.n > 400;
-    size words = 0, i = 0;
-    uint last = 1, carry = 0;
-    for (; body.n - i >= 16; i += 16) {
-        Vec w = *(const Vec *)(body.p + i);
-        Vec lf = w == SPLAT('\n');
-        uint breaks = __builtin_ia32_pmovmskb128(lf);
-        for (uint bits = breaks; bits; bits &= bits - 1)
-            add_line_end(lines, i + first_bit(bits));
-
-        if (count_words) {
-            Vec ws = (w == SPLAT(' ')) | ((w > SPLAT(8)) & (w < SPLAT(14)));
-            uint gaps = carry | (uint)__builtin_ia32_pmovmskb128(ws);
-            uint unicode = __builtin_ia32_pmovmskb128(
-                (w == SPLAT((char)0xc2)) | (w == SPLAT((char)0xe1)) | (w == SPLAT((char)0xe2)) |
-                (w == SPLAT((char)0xe3)) | (w == SPLAT((char)0xef)));
-            for (; unicode; unicode &= unicode - 1) {
-                uint j = first_bit(unicode);
-                size width = space_width(body, i + j);
-                gaps |= ((1u << width) - 1) << j;
-            }
-            words += bit_count(~gaps & ((gaps << 1) | last) & 0xffff);
-            last = (gaps >> 15) & 1;
-            carry = gaps >> 16;
-        }
-    }
-
-    // A multibyte whitespace character can straddle the final vector and tail.
-    i += (carry & 1) + (carry >> 1);
-    while (i < body.n) {
-        if (body.p[i] == '\n') add_line_end(lines, i);
-        if (count_words) {
-            size width = space_width(body, i);
-            if (width) {
-                last = 1;
-                i += width;
-                continue;
-            }
-            words += last;
-            last = 0;
-        }
-        i++;
-    }
-    add_line_end(lines, body.n);
-    return words ? (words + 199) / 200 : 1;
-}
-
 typedef struct Heading Heading;
 struct Heading {
     Heading *next;
     Value item, level, id, html;
-    Field fields[3];
+    const Value *fields[3];
 };
 
 Markdown markdown(Str body, ResolveLink resolve, void *context) {
-    uint line_ends[128];
-    Lines lines = {.body = body, .end = NPOS, .ends = line_ends, .cap = COUNT(line_ends)};
-    Markdown result = {.excerpt = {.kind = RENDERED}, .minutes = index_lines(&lines)};
+    Lines lines = {.body = body, .end = NPOS, .preceding_gap = 1};
+    Markdown result = {.excerpt = {.kind = RENDERED}};
     Buf html = {0};
-    if (body.n) room(&html, body.n + body.n / 2 + 128);
+    if (body.n) room(&html, body.n * 2 + 256);
     Entry local_ids[8] = {0};
     Map ids = {.entries = local_ids, .cap = COUNT(local_ids)};
     Heading *toc = 0, **next = &toc;
@@ -408,10 +437,10 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
                 heading->level = numeric(kind);
                 heading->id = string(id);
                 heading->html = rendered(tail(take(&html), from));
-                heading->fields[0] = (Field){PROP_LEVEL, &heading->level};
-                heading->fields[1] = (Field){PROP_ID, &heading->id};
-                heading->fields[2] = (Field){PROP_HTML, &heading->html};
-                heading->item = record(heading->fields, COUNT(heading->fields));
+                heading->fields[0] = &heading->level;
+                heading->fields[1] = &heading->id;
+                heading->fields[2] = &heading->html;
+                heading->item = record(HEADING_FIELDS, heading->fields, COUNT(heading->fields));
                 *next = heading;
                 next = &heading->next;
                 count++;
@@ -444,6 +473,7 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
 
     const Value **items = NEW(const Value *, count);
     for (size i = 0; toc; i++, toc = toc->next) items[i] = &toc->item;
+    result.minutes = lines.words ? (lines.words + 199) / 200 : 1;
     result.toc = array(items, count);
     result.html = rendered(take(&html));
     return result;

@@ -4,9 +4,12 @@ enum JsonKind { JSTRING, JNUMBER, JARRAY, JOBJECT, JNULL, JBOOLEAN };
 
 typedef struct Json Json;
 struct Json {
-    Json *next, *child;
-    Str key, text;
-    size count;
+    Json *next;
+    Str key;
+    union {
+        Str text;
+        struct { Json *child; size count; };
+    };
     enum JsonKind kind;
     int has_cr;
 };
@@ -50,15 +53,15 @@ static uint string_marks(Vec bytes) {
 }
 
 static size json_mark(Str input, size i) {
-    for (; input.n - i >= 16; i += 16) {
+    while (i < input.n) {
         uint mask = string_marks(*(const Vec *)(input.p + i));
-        if (mask) return i + first_bit(mask);
+        if (mask) {
+            size end = i + first_bit(mask);
+            return end < input.n ? end : input.n;
+        }
+        i += 16;
     }
-    for (; i < input.n; i++) {
-        uint c = (byte)input.p[i];
-        if (c < 32 || c == '"' || c == '\\') break;
-    }
-    return i;
+    return input.n;
 }
 
 static int has_unicode_escape(Str input) {
@@ -75,6 +78,11 @@ static int has_unicode_escape(Str input) {
     return 0;
 }
 
+static const byte unescape[128] = {
+    ['\\'] = '\\', ['"'] = '"', ['/'] = '/',
+    ['b'] = '\b', ['f'] = '\f', ['n'] = '\n', ['r'] = '\r', ['t'] = '\t',
+};
+
 static Str read_string(Parser *p, int *has_cr) {
     expect(p, '"');
     Str input = p->source;
@@ -84,58 +92,50 @@ static Str read_string(Parser *p, int *has_cr) {
         p->pos = end + 1;
         return slice(input, from, end);
     }
-    // Decode into the private input buffer, leaving every unread byte in place.
+    // Decode into the input buffer. The read cursor stays ahead of the write cursor.
     char *text = (char *)input.p + from;
     char *write = (char *)input.p + end;
     for (;;) {
-        int c = at(input, end);
-        if (c != '\\') fail();
-        c = at(input, end + 1);
+        if (at(input, end) != '\\') fail();
+        unsigned c = at(input, end + 1);
         from = end + 2;
-        switch (c) {
-            case '\\': case '"': case '/': *write++ = c; break;
-            case 'b': *write++ = '\b'; break;
-            case 'f': *write++ = '\f'; break;
-            case 'n': *write++ = '\n'; break;
-            case 'r':
-                if (has_cr) *has_cr = 1;
-                *write++ = '\r';
-                break;
-            case 't': *write++ = '\t'; break;
-            case 'u': {
-                int cp = hex4(input, from);
-                if (cp < 0) fail();
-                if (has_cr && cp == '\r') *has_cr = 1;
-                from += 4;
-                if (cp >= 0xd800 && cp <= 0xdbff && at(input, from) == '\\' && at(input, from + 1) == 'u') {
-                    int low = hex4(input, from + 2);
-                    if (low >= 0xdc00 && low <= 0xdfff) {
-                        cp = 0x10000 + ((cp - 0xd800) << 10) + low - 0xdc00;
-                        from += 6;
-                    }
+        byte decoded = c < COUNT(unescape) ? unescape[c] : 0;
+        if (decoded) {
+            *write++ = decoded;
+            if (decoded == '\r' && has_cr) *has_cr = 1;
+        } else {
+            if (c != 'u') fail();
+            int cp = hex4(input, from);
+            if (cp < 0) fail();
+            if (has_cr && cp == '\r') *has_cr = 1;
+            from += 4;
+            if (cp >= 0xd800 && cp <= 0xdbff && at(input, from) == '\\' && at(input, from + 1) == 'u') {
+                int low = hex4(input, from + 2);
+                if (low >= 0xdc00 && low <= 0xdfff) {
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + low - 0xdc00;
+                    from += 6;
                 }
-                Buf encoded = {write, 0, 4};
-                encode(&encoded, cp);
-                write += encoded.n;
-                break;
             }
-            default: fail();
+            Buf encoded = {write, 0, 4};
+            encode(&encoded, cp);
+            write += encoded.n;
         }
-        while (input.n - from >= 16) {
+        for (;;) {
+            // The input arena has a readable SIMD tail.
             Vec bytes = *(const Vec *)(input.p + from);
             uint hits = string_marks(bytes);
-            if (hits) {
-                end = from + first_bit(hits);
-                goto mark_found;
+            if (hits || input.n - from < 16) {
+                size n = hits ? first_bit(hits) : 16;
+                if (n > input.n - from) n = input.n - from;
+                copy(write, input.p + from, n);
+                write += n;
+                end = from + n;
+                break;
             }
             *(Vec *)write = bytes;
             write += 16;
             from += 16;
         }
-        end = json_mark(input, from);
-mark_found:
-        copy(write, input.p + from, end - from);
-        write += end - from;
         if (at(input, end) == '"') break;
     }
     p->pos = end + 1;
@@ -255,7 +255,7 @@ struct Page {
     int post;
     Markdown md;
     Value card, link, data;
-    Field fields[14];
+    const Value *fields[14];
     Value values[14];
 };
 
@@ -263,14 +263,14 @@ struct TagEntry {
     Str slug;
     Value name, slug_value, url, count, posts;
     Value reference, metadata, listing;
-    Field fields[5];
+    const Value *fields[5];
     const Value **cards;
     size n, cap;
 };
 
 typedef struct {
     Str base;
-    Map templates, sources, statics, directories, broken, written, tags, tag_slugs;
+    Map templates, sources, statics, directories, links, broken, written, tags, tag_slugs;
     Warning *warnings;
     size warning_count;
     TagEntry **tag_order;
@@ -474,8 +474,8 @@ static void load_templates(Site *site, const Json *templates) {
         else set(&site->templates, entry->key, t);
     }
     for (size i = 0; i < site->templates.cap; i++) {
-        const Template *t = site->templates.entries[i].val;
-        if (t) prepare_template(*t, &site->templates);
+        Template *t = site->templates.entries[i].val;
+        if (t) prepare_template(t, &site->templates);
     }
 }
 
@@ -518,7 +518,7 @@ static void add_page(Site *site, Page *page, const File *file) {
     PHASE_END(front_phase);
 }
 
-typedef struct { Site *site; Page *page; Map cache; } LinkContext;
+typedef struct { Site *site; Page *page; Map *resolved; } LinkContext;
 
 static int scheme(Str target) {
     if (!letter(at(target, 0))) return 0;
@@ -595,9 +595,19 @@ static Str link_target(void *context, Str target) {
     int first = at(target, 0);
     if (first == '/' || first == '#' || scheme(target)) return target;
     LinkContext *link = context;
-    Str *saved = get(&link->cache, target);
-    if (saved) return *saved;
     Site *site = link->site;
+    if (!link->resolved) {
+        void **slot = entry_value(&site->links, link->page->directory);
+        if (!*slot) {
+            Map *links = NEW(Map, 1);
+            *links = (Map){0};
+            *slot = links;
+        }
+        link->resolved = *slot;
+    }
+    // Successful links depend only on the directory and the target within a case.
+    Str *saved = get(link->resolved, target);
+    if (saved) return *saved;
     size hash = find_char(target, 0, '#');
     if (hash == NPOS) hash = target.n;
     Str frag = tail(target, hash);
@@ -605,7 +615,7 @@ static Str link_target(void *context, Str target) {
     Str resolved = target;
     if (path.p) {
         const Page *page = get(&site->sources, path);
-        if (page) resolved = JOIN(page->url, frag);
+        if (page) resolved = frag.n ? JOIN(page->url, frag) : page->url;
         else if (get(&site->statics, path)) resolved = JOIN(site->base, S("/"), path, frag);
     }
     if (resolved.p == target.p) {
@@ -614,10 +624,11 @@ static Str link_target(void *context, Str target) {
             set(&site->broken, warning, (void *)1);
             warn(site, warning);
         }
+    } else {
+        saved = NEW(Str, 1);
+        *saved = resolved;
+        set(link->resolved, target, saved);
     }
-    saved = NEW(Str, 1);
-    *saved = resolved;
-    set(&link->cache, target, saved);
     return resolved;
 }
 
@@ -639,14 +650,14 @@ static TagEntry *make_tag(Site *site, Str name, Str slug, int post) {
         .slug = slug, .name = string(name), .slug_value = string(slug),
         .url = string(post ? JOIN(site->base, S("/tags/"), slug, S("/")) : S("")),
     };
-    tag->fields[0] = (Field){PROP_NAME, &tag->name};
-    tag->fields[1] = (Field){PROP_SLUG, &tag->slug_value};
-    tag->fields[2] = (Field){PROP_URL, &tag->url};
-    tag->fields[3] = (Field){PROP_COUNT, &tag->count};
-    tag->fields[4] = (Field){PROP_POSTS, &tag->posts};
-    tag->reference = record(tag->fields, 3);
-    tag->metadata = record(tag->fields, 4);
-    tag->listing = record(tag->fields, 5);
+    tag->fields[0] = &tag->name;
+    tag->fields[1] = &tag->slug_value;
+    tag->fields[2] = &tag->url;
+    tag->fields[3] = &tag->count;
+    tag->fields[4] = &tag->posts;
+    tag->reference = record(TAG_FIELDS, tag->fields, 3);
+    tag->metadata = record(TAG_FIELDS, tag->fields, 4);
+    tag->listing = record(TAG_FIELDS, tag->fields, 5);
     if (post) set(&site->tags, slug, tag);
     return tag;
 }
@@ -701,11 +712,7 @@ enum PageField {
 };
 
 static void card(Site *site, Page *page) {
-    static const enum Property names[] = {
-        PROP_TITLE, PROP_URL, PROP_DATE, PROP_DATE_LONG, PROP_SUMMARY, PROP_EXCERPT, PROP_READING_MINUTES,
-        PROP_TAGS, PROP_SLUG, PROP_CONTENT, PROP_TOC, PROP_NEWER, PROP_OLDER, PROP_IS_POST
-    };
-    _Static_assert(P_FIELDS == COUNT(names) && P_FIELDS == COUNT(((Page *)0)->fields), "page fields");
+    _Static_assert(P_FIELDS == COUNT(((Page *)0)->fields), "page fields");
     Value *v = page->values;
     v[P_TITLE] = string(page->front.title);
     v[P_URL] = string(page->url);
@@ -719,10 +726,10 @@ static void card(Site *site, Page *page) {
     v[P_CONTENT] = page->md.html;
     v[P_TOC] = page->md.toc;
     v[P_IS_POST] = boolean(page->post);
-    for (size i = 0; i < P_FIELDS; i++) page->fields[i] = (Field){names[i], &v[i]};
-    page->link = record(page->fields, P_SUMMARY);
-    page->card = record(page->fields, P_SLUG);
-    page->data = record(page->fields, P_FIELDS);
+    for (size i = 0; i < P_FIELDS; i++) page->fields[i] = &v[i];
+    page->link = record(PAGE_FIELDS, page->fields, P_SUMMARY);
+    page->card = record(PAGE_FIELDS, page->fields, P_SLUG);
+    page->data = record(PAGE_FIELDS, page->fields, P_FIELDS);
 }
 
 static Value collect_tags(Site *site) {
@@ -772,13 +779,12 @@ static void write_indexes(Site *site, Buf *out, const Template *template, const 
         Str next = n < pages ? index_url(site->base, n + 1) : (Str){0};
         Value number_value = numeric(n), total_value = numeric(pages), url = string(current);
         Value newer = string(prev), older = string(next);
-        Field pager_fields[] = {{PROP_NUMBER, &number_value}, {PROP_TOTAL, &total_value},
-            {PROP_URL, &url}, {PROP_NEWER_URL, &newer}, {PROP_OLDER_URL, &older}};
+        const Value *pager_fields[] = {&number_value, &total_value, &url, &newer, &older};
         size first = (n - 1) * per_page, count = post_count - first;
         if (count > per_page) count = per_page;
-        Value posts = array(cards + first, count), pager = record(pager_fields, COUNT(pager_fields));
-        Field fields[] = {{PROP_POSTS, &posts}, {PROP_PAGER, &pager}};
-        Value locals = record(fields, COUNT(fields));
+        Value posts = array(cards + first, count), pager = record(PAGER_FIELDS, pager_fields, COUNT(pager_fields));
+        const Value *fields[] = {&posts, &pager};
+        Value locals = record(INDEX_FIELDS, fields, COUNT(fields));
         Str path = n == 1 ? S("index.html") : JOIN(S("page/"), number(n), S("/index.html"));
         write_template(site, out, path, template, &locals, globals);
         prev = current;
@@ -869,8 +875,7 @@ static void build_site(Buf *out, const Json *input) {
 
     PHASE(MARKDOWN);
     for (i = 0; i < page_count; i++) {
-        Entry links[8] = {0};
-        LinkContext context = {.site = &site, .page = &pages[i], .cache = {links, 0, COUNT(links)}};
+        LinkContext context = {.site = &site, .page = &pages[i]};
         pages[i].md = markdown(pages[i].front.body, link_target, &context);
     }
 
@@ -889,22 +894,22 @@ static void build_site(Buf *out, const Json *input) {
         if (!pages[i].post) card(&site, &pages[i]);
 
     Value title_value = string(title), base_value = string(base);
-    Field site_fields[] = {{PROP_TITLE, &title_value}, {PROP_BASE_URL, &base_value}};
-    Value site_value = record(site_fields, COUNT(site_fields));
+    const Value *site_fields[] = {&title_value, &base_value};
+    Value site_value = record(SITE_FIELDS, site_fields, COUNT(site_fields));
     Value tags_value = collect_tags(&site);
     if (recent < 0) recent += (long)post_count;
     if (recent < 0) recent = 0;
     if ((size)recent > post_count) recent = post_count;
     Value recent_value = array(cards, recent);
-    Field global_fields[] = {{PROP_SITE, &site_value}, {PROP_TAGS, &tags_value}, {PROP_RECENT, &recent_value}};
-    Value globals = record(global_fields, COUNT(global_fields));
+    const Value *global_fields[] = {&site_value, &tags_value, &recent_value};
+    Value globals = record(GLOBAL_FIELDS, global_fields, COUNT(global_fields));
 
     PHASE(TEMPLATES);
     put(out, '{');
     for (i = 0; i < page_count; i++) {
         Page *p = &pages[i];
-        Field local = {PROP_PAGE, &p->data};
-        Value root = record(&local, 1);
+        const Value *local = &p->data;
+        Value root = record(PAGE_ROOT, &local, 1);
         write_template(&site, out, p->output, p->layout, &root, &globals);
     }
     const Template *index = get(&site.templates, S("index"));
@@ -913,8 +918,8 @@ static void build_site(Buf *out, const Json *input) {
     if (tag_template) {
         for (i = 0; i < site.tag_count; i++) {
             const TagEntry *t = site.tag_order[i];
-            Field local = {PROP_TAG, &t->listing};
-            Value root = record(&local, 1);
+            const Value *local = &t->listing;
+            Value root = record(TAG_ROOT, &local, 1);
             Str path = JOIN(S("tags/"), t->slug, S("/index.html"));
             write_template(&site, out, path, tag_template, &root, &globals);
         }

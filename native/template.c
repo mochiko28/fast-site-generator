@@ -1,15 +1,21 @@
 #include "core.h"
 
-enum NodeKind { TEXT, RAW, ESCAPED, TAG, FOR, IF, INCLUDE };
+enum NodeKind { END, TEXT, RAW, ESCAPED, TAG, FOR, IF, INCLUDE };
 
-typedef struct { Str name; enum Property *parts; size n; } Path;
+enum PathRoot { FREE_NAME, LOOP_ITEM, LOOP_INFO };
+typedef struct {
+    Str name;
+    enum Property *parts;
+    size n;
+    enum PathRoot root;
+    uint up;
+} Path;
 struct Node {
     enum NodeKind kind;
     int negate;
     Str text;
     Path path;
     Node *next, *body, *alternative;
-    Template *include;
 };
 
 static int identifier_start(int c) { return letter(c) || c == '_'; }
@@ -183,16 +189,56 @@ Template parse_template(Str source) {
     return result;
 }
 
-static void prepare_nodes(Node *nodes, const Map *templates) {
-    for (Node *node = nodes; node; node = node->next) {
-        if (node->kind == INCLUDE) node->include = get(templates, node->text);
-        if (node->body) prepare_nodes(node->body, templates);
-        if (node->alternative) prepare_nodes(node->alternative, templates);
+typedef struct Binding Binding;
+struct Binding { Str name; const Binding *outer; };
+
+struct Op {
+    enum NodeKind kind;
+    int negate;
+    Str text;
+    Path path;
+    const Op *body, *alternative;
+    Template *include;
+};
+
+// Keep each branch contiguous and resolve lookups bound by loops in this
+// template. Includes can also inherit names from the calling scope.
+static Op *compile_nodes(const Node *nodes, const Map *templates, const Binding *bindings) {
+    if (!nodes) return 0;
+    size n = 0;
+    for (const Node *node = nodes; node; node = node->next) n++;
+    Op *ops = NEW(Op, n + 1);
+    size i = 0;
+    for (const Node *node = nodes; node; node = node->next, i++) {
+        Op *op = &ops[i];
+        *op = (Op){.kind = node->kind, .text = node->text, .path = node->path, .negate = node->negate};
+        if (op->path.n) {
+            for (const Binding *b = bindings; b; b = b->outer, op->path.up++) {
+                if (equal(op->path.name, S("loop"))) {
+                    op->path.root = LOOP_INFO;
+                    break;
+                }
+                if (equal(op->path.name, b->name)) {
+                    op->path.root = LOOP_ITEM;
+                    break;
+                }
+            }
+        }
+        if (node->kind == INCLUDE) op->include = get(templates, node->text);
+        else if (node->kind == FOR) {
+            Binding binding = {node->text, bindings};
+            op->body = compile_nodes(node->body, templates, &binding);
+        } else if (node->kind == IF) {
+            op->body = compile_nodes(node->body, templates, bindings);
+            op->alternative = compile_nodes(node->alternative, templates, bindings);
+        }
     }
+    ops[n].kind = END;
+    return ops;
 }
 
-void prepare_template(Template template, const Map *templates) {
-    prepare_nodes(template.nodes, templates);
+void prepare_template(Template *template, const Map *templates) {
+    template->ops = compile_nodes(template->nodes, templates, 0);
 }
 
 typedef struct Scope Scope;
@@ -204,26 +250,28 @@ struct Scope {
     size root_names;
 };
 
-static const Value *lookup(const Scope *scope, Path path) {
-    Str name = path.name;
+static const Value *lookup(const Scope *scope, const Path *path) {
+    for (uint up = path->up; up; up--) scope = scope->parent;
     const Value *v;
-    for (;;) {
-        if (!scope->parent) {
-            v = property(scope->root, path.parts[0]);
-            if (!v) v = property(scope->globals, path.parts[0]);
-            break;
+    if (path->root != FREE_NAME) {
+        v = path->root == LOOP_ITEM ? scope->item : scope->loop;
+    } else {
+        while (scope->parent) {
+            if (equal(path->name, S("loop"))) {
+                v = scope->loop;
+                goto descend;
+            }
+            if (equal(path->name, scope->name)) {
+                v = scope->item;
+                goto descend;
+            }
+            scope = scope->parent;
         }
-        if (equal(name, S("loop"))) {
-            v = scope->loop;
-            break;
-        }
-        if (equal(name, scope->name)) {
-            v = scope->item;
-            break;
-        }
-        scope = scope->parent;
+        v = property(scope->root, path->parts[0]);
+        if (!v) v = property(scope->globals, path->parts[0]);
     }
-    for (size i = 1; v && i < path.n; i++) v = property(v, path.parts[i]);
+descend:
+    for (size i = 1; v && i < path->n; i++) v = property(v, path->parts[i]);
     return v;
 }
 
@@ -272,7 +320,7 @@ static void write_value(Buf *out, const Value *v, int raw) {
     }
 }
 
-static void render_nodes(Buf *out, const Node *nodes, const Scope *scope, uint include_depth, uint stack_depth);
+static void render_ops(Buf *out, const Op *ops, const Scope *scope, uint include_depth, uint stack_depth);
 
 // An included template is reusable when its free names resolve to globals,
 // missing values, and at most one loop item. Loop metadata varies by iteration.
@@ -284,9 +332,6 @@ struct Memo {
     Map by_item;
 };
 _Static_assert(PROP_URL < 64, "template property mask");
-
-typedef struct Binding Binding;
-struct Binding { Str name; const Binding *outer; };
 
 static void add_free_name(Memo *memo, Path path, const Binding *bindings) {
     Str name = path.name;
@@ -302,8 +347,9 @@ static void add_free_name(Memo *memo, Path path, const Binding *bindings) {
     }
 }
 
-static void collect_free(Memo *memo, const Node *nodes, uint depth, const Binding *bindings, size *budget) {
-    for (const Node *node = nodes; node && !memo->disabled; node = node->next) {
+static void collect_free(Memo *memo, const Op *ops, uint depth, const Binding *bindings, size *budget) {
+    if (!ops) return;
+    for (const Op *node = ops; node->kind != END && !memo->disabled; node++) {
         if (!*budget) {
             memo->disabled = 1;
             return;
@@ -317,7 +363,7 @@ static void collect_free(Memo *memo, const Node *nodes, uint depth, const Bindin
             collect_free(memo, node->body, depth, bindings, budget);
             collect_free(memo, node->alternative, depth, bindings, budget);
         } else if (node->kind == INCLUDE && node->include && depth < 8) {
-            collect_free(memo, node->include->nodes, depth + 1, bindings, budget);
+            collect_free(memo, node->include->ops, depth + 1, bindings, budget);
         }
     }
 }
@@ -327,10 +373,10 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
     if (!memo) {
         template->memo[depth] = memo = zero(NEW(Memo, 1), sizeof(*memo));
         size budget = 4096;
-        collect_free(memo, template->nodes, depth, 0, &budget);
+        collect_free(memo, template->ops, depth, 0, &budget);
     }
     if (memo->disabled) {
-        render_nodes(out, template->nodes, scope, depth, stack_depth);
+        render_ops(out, template->ops, scope, depth, stack_depth);
         return;
     }
 
@@ -362,7 +408,7 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
             return;
         }
         size start = out->n;
-        render_nodes(out, template->nodes, scope, depth, stack_depth);
+        render_ops(out, template->ops, scope, depth, stack_depth);
         Str *text = NEW(Str, 1);
         *text = tail(take(out), start);
         set(&memo->by_item, JOIN(key), text);
@@ -373,56 +419,57 @@ static void render_include(Buf *out, Template *template, const Scope *scope, uin
         return;
     }
     size start = out->n;
-    render_nodes(out, template->nodes, scope, depth, stack_depth);
+    render_ops(out, template->ops, scope, depth, stack_depth);
     memo->constant = tail(take(out), start);
     memo->has_constant = 1;
     return;
 
 uncached:
-    render_nodes(out, template->nodes, scope, depth, stack_depth);
+    render_ops(out, template->ops, scope, depth, stack_depth);
 }
 
 
-static void render_loop(Buf *out, const Node *node, const Scope *scope, uint depth, uint stack_depth) {
-    const Value *v = lookup(scope, node->path);
+static void render_loop(Buf *out, const Op *node, const Scope *scope, uint depth, uint stack_depth) {
+    const Value *v = lookup(scope, &node->path);
     if (!v || v->kind != ARRAY || !node->body) return;
     size count = v->array.n;
     Value index = numeric(0), first = boolean(0), last = boolean(0), length = numeric(count);
-    Field fields[] = {{PROP_INDEX, &index}, {PROP_FIRST, &first}, {PROP_LAST, &last}, {PROP_LENGTH, &length}};
-    Value loop = record(fields, COUNT(fields));
+    const Value *fields[] = {&index, &first, &last, &length};
+    Value loop = record(LOOP_FIELDS, fields, COUNT(fields));
     Scope child = {.parent = scope, .name = node->text, .loop = &loop};
     for (size i = 0; i < count; i++) {
         index.number = i + 1;
         first.number = i == 0;
         last.number = i + 1 == count;
         child.item = v->array.items[i];
-        render_nodes(out, node->body, &child, depth, stack_depth);
+        render_ops(out, node->body, &child, depth, stack_depth);
     }
 }
 
-static void render_nodes(Buf *out, const Node *nodes, const Scope *scope, uint include_depth, uint stack_depth) {
+static void render_ops(Buf *out, const Op *ops, const Scope *scope, uint include_depth, uint stack_depth) {
+    if (!ops) return;
     if (stack_depth > 512) fail();
-    for (const Node *node = nodes; node; node = node->next) {
+    for (const Op *node = ops; node->kind != END; node++) {
         switch (node->kind) {
             case TEXT:
                 append(out, node->text);
                 break;
             case RAW: case ESCAPED:
-                write_value(out, lookup(scope, node->path), node->kind == RAW);
+                write_value(out, lookup(scope, &node->path), node->kind == RAW);
                 break;
             case FOR:
                 render_loop(out, node, scope, include_depth, stack_depth + 1);
                 break;
             case IF: {
-                int yes = truthy(lookup(scope, node->path)) != node->negate;
-                render_nodes(out, yes ? node->body : node->alternative, scope, include_depth, stack_depth + 1);
+                int yes = truthy(lookup(scope, &node->path)) != node->negate;
+                render_ops(out, yes ? node->body : node->alternative, scope, include_depth, stack_depth + 1);
                 break;
             }
             case INCLUDE:
                 if (node->include && include_depth < 8)
                     render_include(out, node->include, scope, include_depth + 1, stack_depth + 1);
                 break;
-            case TAG:
+            case TAG: case END:
                 fail();
         }
     }
@@ -430,7 +477,13 @@ static void render_nodes(Buf *out, const Node *nodes, const Scope *scope, uint i
 
 void render_template(Buf *out, const Template *template, const Value *root, const Value *globals) {
     Scope scope = {.root = root, .globals = globals};
-    if (root)
-        for (size i = 0; i < root->record.n; i++) scope.root_names |= 1UL << root->record.items[i].name;
-    render_nodes(out, template->nodes, &scope, 0, 0);
+    if (root) {
+        static const size root_names[TAG_ROOT + 1] = {
+            [PAGE_ROOT] = 1UL << PROP_PAGE,
+            [TAG_ROOT] = 1UL << PROP_TAG,
+            [INDEX_FIELDS] = (1UL << PROP_POSTS) | (1UL << PROP_PAGER),
+        };
+        scope.root_names = root_names[root->record.layout];
+    }
+    render_ops(out, template->ops, &scope, 0, 0);
 }

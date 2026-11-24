@@ -100,14 +100,17 @@ enum Property { PROP_UNKNOWN,
     PROP_RECENT, PROP_SITE, PROP_SLUG, PROP_SUMMARY, PROP_TAG, PROP_TAGS,
     PROP_TITLE, PROP_TOC, PROP_TOTAL, PROP_URL
 };
-typedef struct { enum Property name; const Value *value; } Field;
+enum RecordLayout {
+    PAGE_FIELDS, TAG_FIELDS, HEADING_FIELDS, LOOP_FIELDS, PAGER_FIELDS,
+    INDEX_FIELDS, SITE_FIELDS, GLOBAL_FIELDS, PAGE_ROOT, TAG_ROOT
+};
 struct Value {
     enum ValueKind kind;
     union {
         Str text;
         size number;
         struct { const Value **items; size n; } array;
-        struct { const Field *items; size n; } record;
+        struct { const Value *const *items; uint n; enum RecordLayout layout; } record;
     };
 };
 
@@ -117,8 +120,8 @@ static inline Value boolean(int n) { return (Value){.kind = BOOLEAN, .number = n
 static inline Value array(const Value **items, size n) {
     return (Value){.kind = ARRAY, .array = {items, n}};
 }
-static inline Value record(const Field *items, size n) {
-    return (Value){.kind = RECORD, .record = {items, n}};
+static inline Value record(enum RecordLayout layout, const Value *const *items, uint n) {
+    return (Value){.kind = RECORD, .record = {items, n, layout}};
 }
 
 enum Property property_id(Str name);
@@ -127,9 +130,14 @@ static inline Value rendered(Str escaped) { return (Value){.kind = RENDERED, .te
 
 typedef struct Node Node;
 typedef struct Memo Memo;
-typedef struct { Node *nodes; Str error; Memo *memo[9]; } Template;
+typedef struct Op Op;
+typedef struct {
+    union { Node *nodes; Op *ops; };
+    Str error;
+    Memo *memo[9];
+} Template;
 Template parse_template(Str source);
-void prepare_template(Template template, const Map *templates);
+void prepare_template(Template *template, const Map *templates);
 void render_template(Buf *out, const Template *template, const Value *root, const Value *globals);
 
 typedef struct {
@@ -144,7 +152,8 @@ void rewind_arena(size mark);
 void build_answers(Buf *out, Str input);
 
 enum Phase {
-    SETUP, INPUT, PARSE, FRONT, MARKDOWN, TEMPLATES, SLUGS, SERIALIZE, WRITE, PHASE_COUNT
+    SETUP, INPUT, PARSE, FRONT, MARKDOWN, TEMPLATES, SLUGS, SERIALIZE,
+    OPEN_OUTPUT, WRITE, TRUNCATE_OUTPUT, CLOSE_OUTPUT, RENAME_OUTPUT, PHASE_COUNT
 };
 #ifdef SITE_PROFILE
 void profile_stage(enum Phase next);

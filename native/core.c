@@ -12,8 +12,8 @@ int latin1;
 
 enum LinuxCall {
     SYS_READ = 0, SYS_WRITE = 1, SYS_OPEN = 2, SYS_CLOSE = 3, SYS_FSTAT = 5,
-    SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_RENAME = 82, SYS_UNLINK = 87,
-    SYS_EXIT_GROUP = 231,
+    SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_FLOCK = 73, SYS_FTRUNCATE = 77,
+    SYS_RENAME = 82, SYS_UNLINK = 87, SYS_EXIT_GROUP = 231,
 };
 
 static inline long sys3(long n, long a, long b, long c) {
@@ -279,17 +279,18 @@ static int read_file(long fd, char *bytes, size count) {
     return 1;
 }
 
+// Linux x86-64 struct stat.
+typedef struct {
+    unsigned long dev, ino, nlink;
+    uint mode, uid, gid, pad;
+    unsigned long rdev;
+    long length, remaining[11];
+} FileStatus;
+
 static Str read_input(const char *path) {
     long fd = open_file(path, 0, 0);
     if (fd < 0) fail();
-
-    // Linux x86-64 struct stat, including st_mode and st_size.
-    struct {
-        unsigned long dev, ino, nlink;
-        uint mode, uid, gid, pad;
-        unsigned long rdev;
-        long length, remaining[11];
-    } info;
+    FileStatus info;
     if (sys3(SYS_FSTAT, fd, (long)&info, 0) < 0 || (info.mode & 0170000) != 0100000
         || info.length < 0 || (size)info.length >= ALLOC_LIMIT - used) {
         close_file(fd);
@@ -338,23 +339,59 @@ static void paths(Str *input, Str *output) {
     *output = JOIN(out, S("/answers.json\0"));
 }
 
-static int publish(Str path, const Buf *out) {
-    // Publish only a completed file. A failed write leaves the final path intact.
+static int write_answer(long fd, const Buf *out) {
+    PHASE(WRITE);
+    size pos = 0;
+    while (pos < out->n) {
+        size count = out->n - pos;
+        long wrote = sys3(SYS_WRITE, fd, (long)(out->p + pos), count);
+        if (wrote == -4) continue;
+        if (wrote <= 0) return 0;
+        pos += wrote;
+    }
+    return 1;
+}
+
+static int publish_temporary(Str path, const Buf *out) {
+    PHASE(OPEN_OUTPUT);
     Str temporary = JOIN(slice(path, 0, path.n - 1), S(".native-"),
                          number(sys3(SYS_GETPID, 0, 0, 0)), S("\0"));
     long fd = open_file(temporary.p, 1 | 64 | 128, 0666);  // O_WRONLY | O_CREAT | O_EXCL
     if (fd < 0) return 0;
-    size pos = 0;
-    while (pos < out->n) {
-        long wrote = sys3(SYS_WRITE, fd, (long)(out->p + pos), out->n - pos);
-        if (wrote == -4) continue;
-        if (wrote <= 0) break;
-        pos += wrote;
-    }
-    if (close_file(fd) == 0 && pos == out->n
-        && sys3(SYS_RENAME, (long)temporary.p, (long)path.p, 0) == 0) return 1;
+    int written = write_answer(fd, out);
+    PHASE(CLOSE_OUTPUT);
+    int closed = close_file(fd) == 0;
+    PHASE(RENAME_OUTPUT);
+    if (closed && written && sys3(SYS_RENAME, (long)temporary.p, (long)path.p, 0) == 0) return 1;
     sys3(SYS_UNLINK, (long)temporary.p, 0, 0);
     return 0;
+}
+
+static int publish(Str path, const Buf *out) {
+    PHASE(OPEN_OUTPUT);
+    // Serialize native writers and reuse the existing regular file's cached pages.
+    // Keep replacement semantics for symlinks and other nonregular paths.
+    long fd = open_file(path.p, 1 | 64 | 2048 | 131072, 0666);  // O_WRONLY | O_CREAT | O_NONBLOCK | O_NOFOLLOW
+    if (fd < 0) return publish_temporary(path, out);
+    FileStatus info;
+    if (sys3(SYS_FSTAT, fd, (long)&info, 0) < 0 || (info.mode & 0170000) != 0100000 || info.nlink != 1) {
+        close_file(fd);
+        return publish_temporary(path, out);
+    }
+    long locked;
+    do locked = sys3(SYS_FLOCK, fd, 2, 0); while (locked == -4);  // LOCK_EX
+    // Another native writer can change the size before this writer gets the lock.
+    if (locked < 0 || sys3(SYS_FSTAT, fd, (long)&info, 0) < 0 || info.nlink != 1) {
+        close_file(fd);
+        return publish_temporary(path, out);
+    }
+
+    int ok = write_answer(fd, out);
+    PHASE(TRUNCATE_OUTPUT);
+    if (ok && (size)info.length > out->n)
+        ok = sys3(SYS_FTRUNCATE, fd, out->n, 0) == 0;
+    PHASE(CLOSE_OUTPUT);
+    return close_file(fd) == 0 && ok;
 }
 
 #ifdef SITE_PROFILE
@@ -365,7 +402,8 @@ typedef struct {
 
 static const Str phase_names[] = {
     S("setup"), S("input"), S("parse"), S("front"), S("markdown"),
-    S("templates"), S("slugs"), S("serialize"), S("write"),
+    S("templates"), S("slugs"), S("serialize"), S("open_output"), S("write"),
+    S("truncate_output"), S("close_output"), S("rename_output"),
 };
 _Static_assert(COUNT(phase_names) == PHASE_COUNT, "phase names");
 
@@ -455,7 +493,6 @@ static void job(void) {
     Str source = read_input(input.p);
     Buf answer = {arena, 0, OUTPUT_LIMIT};
     build_answers(&answer, source);
-    PHASE(WRITE);
     if (!publish(output, &answer)) fail();
 #ifdef SITE_PROFILE
     profile_finish();

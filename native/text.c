@@ -32,13 +32,20 @@ uint decode(Str s, size *i) {
 }
 
 void validate_utf8(Str s) {
-    for (size i = 0; i < s.n;) {
-        if ((byte)s.p[i] < 0x80) {
-            i++;
-        } else {
-            uint cp = decode(s, &i);
-            if (cp >= 0xd800 && cp <= 0xdfff) fail();
+    size i = 0;
+    while (s.n - i >= 16) {
+        uint high = __builtin_ia32_pmovmskb128(*(const Vec *)(s.p + i));
+        if (!high) {
+            i += 16;
+            continue;
         }
+        i += first_bit(high);
+        uint cp = decode(s, &i);
+        if (cp >= 0xd800 && cp <= 0xdfff) fail();
+    }
+    while (i < s.n) {
+        uint cp = decode(s, &i);
+        if (cp >= 0xd800 && cp <= 0xdfff) fail();
     }
 }
 
@@ -184,16 +191,25 @@ void json_code_unit(Buf *out, uint cp) {
     out->n += 6;
 }
 
+static inline uint json_marks(Vec w, int html, int unicode) {
+    Vec hit = ((w ^ SPLAT(-128)) < SPLAT(-96)) | (w == SPLAT('"')) | (w == SPLAT('\x5c'));
+    if (html) hit |= (w == SPLAT('&')) | (w == SPLAT('<')) | (w == SPLAT('>')) | (w == SPLAT('\x27'));
+    if (unicode == 1) hit |= w == SPLAT((char)0xed);
+    if (unicode == 2) hit |= w;
+    return __builtin_ia32_pmovmskb128(hit);
+}
+
 static size next_json(Str s, size i, int html, int unicode) {
-    // UTF-8 bytes are all >= 0x80. Bias signed lanes for the unsigned control check.
     for (; s.n - i >= 16; i += 16) {
-        Vec w = *(const Vec *)(s.p + i);
-        Vec hit = ((w ^ SPLAT(-128)) < SPLAT(-96)) | (w == SPLAT('"')) | (w == SPLAT('\\'));
-        if (html) hit |= (w == SPLAT('&')) | (w == SPLAT('<')) | (w == SPLAT('>')) | (w == SPLAT('\''));
-        if (unicode == 1) hit |= w == SPLAT((char)0xed);
-        if (unicode == 2) hit |= w;
-        uint mask = __builtin_ia32_pmovmskb128(hit);
+        uint mask = json_marks(*(const Vec *)(s.p + i), html, unicode);
         if (mask) return i + first_bit(mask);
+    }
+    if (s.n - i >= 8) {
+        typedef long Word __attribute__((aligned(1), may_alias));
+        union { long words[2]; Vec bytes; } block = {.words = {*(const Word *)(s.p + i), 0}};
+        uint mask = json_marks(block.bytes, html, unicode);
+        if (mask & 255) return i + first_bit(mask);
+        i += 8;
     }
     uint mask = 1 | (html ? 2 : 0) | (unicode == 1 ? 8 : unicode == 2 ? 4 : 0);
     for (; i < s.n && !(escape_class[(byte)s.p[i]] & mask); i++) {}
@@ -302,7 +318,9 @@ static Str slug_projection(uint cp) {
 }
 
 static void slug_byte(char *buf, size *n, int *gap, int c) {
-    if (!letter(c) && !digit(c)) {
+    uint lower = (uint)c | 32u;
+    if (lower - 'a' <= 'z' - 'a') c = lower;
+    else if ((uint)c - '0' > 9) {
         *gap = *n != 0;
         return;
     }
@@ -315,7 +333,7 @@ static void slug_byte(char *buf, size *n, int *gap, int c) {
         buf[(*n)++] = '-';
         *gap = 0;
     }
-    buf[(*n)++] = letter(c) ? (c | 32) : c;
+    buf[(*n)++] = c;
 }
 
 Str slugify(Str s) {
@@ -421,13 +439,34 @@ enum Property property_id(Str name) {
     return PROP_UNKNOWN;
 }
 
+// The record's width distinguishes prefix views such as cards and page links.
+static const byte field_slots[][PROP_URL + 1] = {
+    [PAGE_FIELDS] = {
+        [PROP_TITLE] = 1, [PROP_URL] = 2, [PROP_DATE] = 3, [PROP_DATE_LONG] = 4,
+        [PROP_SUMMARY] = 5, [PROP_EXCERPT] = 6, [PROP_READING_MINUTES] = 7, [PROP_TAGS] = 8,
+        [PROP_SLUG] = 9, [PROP_CONTENT] = 10, [PROP_TOC] = 11, [PROP_NEWER] = 12,
+        [PROP_OLDER] = 13, [PROP_IS_POST] = 14,
+    },
+    [TAG_FIELDS] = {
+        [PROP_NAME] = 1, [PROP_SLUG] = 2, [PROP_URL] = 3, [PROP_COUNT] = 4, [PROP_POSTS] = 5,
+    },
+    [HEADING_FIELDS] = {[PROP_LEVEL] = 1, [PROP_ID] = 2, [PROP_HTML] = 3},
+    [LOOP_FIELDS] = {[PROP_INDEX] = 1, [PROP_FIRST] = 2, [PROP_LAST] = 3, [PROP_LENGTH] = 4},
+    [PAGER_FIELDS] = {
+        [PROP_NUMBER] = 1, [PROP_TOTAL] = 2, [PROP_URL] = 3, [PROP_NEWER_URL] = 4, [PROP_OLDER_URL] = 5,
+    },
+    [INDEX_FIELDS] = {[PROP_POSTS] = 1, [PROP_PAGER] = 2},
+    [SITE_FIELDS] = {[PROP_TITLE] = 1, [PROP_BASE_URL] = 2},
+    [GLOBAL_FIELDS] = {[PROP_SITE] = 1, [PROP_TAGS] = 2, [PROP_RECENT] = 3},
+    [PAGE_ROOT] = {[PROP_PAGE] = 1},
+    [TAG_ROOT] = {[PROP_TAG] = 1},
+};
+
 const Value *property(const Value *value, enum Property name) {
     if (!value || name == PROP_UNKNOWN) return 0;
     if (value->kind == RECORD) {
-        for (size i = 0; i < value->record.n; i++) {
-            const Field *f = &value->record.items[i];
-            if (name == f->name) return f->value;
-        }
+        uint slot = field_slots[value->record.layout][name];
+        return slot && slot <= value->record.n ? value->record.items[slot - 1] : 0;
     }
     if (value->kind == ARRAY && name == PROP_LENGTH) {
         // Template paths cannot contain a numeric segment.
