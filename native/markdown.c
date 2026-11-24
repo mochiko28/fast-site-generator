@@ -121,162 +121,25 @@ static size link_end(Str s, size i) {
     return NPOS;
 }
 
-static void inline_html(Buf *out, Str s, ResolveLink resolve, void *context, uint depth) {
-    if (!s.n) return;
-    if (depth > 128) fail();
-    const InlineClasses *classes = &inline_classes[latin1];
-    int labels = 1;
-    size i = 0;
-    char *dst = room(out, s.n * 6 + 16);
-    while (i < s.n) {
-        // Both slices have space for a vector at the end. A later token replaces
-        // any speculatively copied bytes beyond the current plain text.
-        Vec bytes = *(const Vec *)(s.p + i);
-        *(Vec *)dst = bytes;
-        uint hits = marks(bytes, classes);
-        size plain = hits ? first_bit(hits) : 16;
-        if (plain >= s.n - i) {
-            dst += s.n - i;
-            break;
-        }
-        i += plain;
-        dst += plain;
-        if (!hits) continue;
+#define INLINE_HTML inline_sse2
+#define INLINE_TARGET
+#define INLINE_SHUFFLE 0
+#include "inline.inc"
+#undef INLINE_HTML
+#undef INLINE_TARGET
+#undef INLINE_SHUFFLE
 
-        unsigned c = (byte)s.p[i];
-        while (c < 64 && c != '*') {
-            const Entity *entity = &escapes[c];
-            __builtin_memcpy(dst, entity, sizeof(*entity));
-            dst += entity->length;
-            i++;
-            // The remaining hits in this vector still describe the original source.
-            size base = i - plain - 1;
-            hits &= hits - 1;
-            size end = hits ? base + first_bit(hits) : base + 16;
-            if (end > s.n) end = s.n;
-            *(Vec *)dst = *(const Vec *)(s.p + i);
-            dst += end - i;
-            i = end;
-            if (!hits || i == s.n) break;
-            plain = i - base;
-            c = (byte)s.p[i];
-        }
-        if (!hits || i == s.n) continue;
-        size next = i + 1;
-        switch (c) {
-            case '\\':
-                c = at(s, next);
-                if (c >= COUNT(escapable) || !escapable[c]) {
-                    *dst++ = '\\';
-                    *dst++ = '\\';
-                } else {
-                    next++;
-                    if (c == '>') {
-                        __builtin_memcpy(dst, "&gt;", 4);
-                        dst += 4;
-                    } else {
-                        if (c == '\\') *dst++ = '\\';
-                        *dst++ = c;
-                    }
-                }
-                break;
-            case 0x60: {
-                size end = arena_char(s, next, '\x60');
-                if (end == NPOS || end == next) goto literal;
-                out->n = dst - out->p;
-                ADD(out, "<code>");
-                escape_code(out, slice(s, next, end));
-                ADD(out, "</code>");
-                next = end + 1;
-                dst = room(out, (s.n - next) * 6 + 16);
-                break;
-            }
-            case '*': {
-                int strong = at(s, next) == '*';
-                next += strong;
-                // Consume a plain emphasis span directly when its closer is
-                // also the next marked byte in the SIMD load.
-                uint remaining = hits & (-1u << (plain + 1 + strong));
-                if (remaining) {
-                    size end = i - plain + first_bit(remaining);
-                    if (end > next && end < s.n && s.p[end] == '*' &&
-                        (at(s, end + 1) == '*') == strong) {
-                        if (strong) {
-                            __builtin_memcpy(dst, "<strong>", 8);
-                            dst += 8;
-                        } else {
-                            __builtin_memcpy(dst, "<em>", 4);
-                            dst += 4;
-                        }
-                        *(Vec *)dst = *(const Vec *)(s.p + next);
-                        dst += end - next;
-                        if (strong) {
-                            __builtin_memcpy(dst, "</strong>", 9);
-                            dst += 9;
-                        } else {
-                            __builtin_memcpy(dst, "</em>", 5);
-                            dst += 5;
-                        }
-                        // Plain emphasis fits in the existing six-byte expansion bound.
-                        i = end + 1 + strong;
-                        continue;
-                    }
-                }
-                size end = closer(s, next, '*', strong, !strong);
-                if (end == NPOS || end == next) {
-                    *dst++ = '*';
-                    if (strong) *dst++ = '*';
-                    break;
-                }
-                out->n = dst - out->p;
-                append(out, strong ? S("<strong>") : S("<em>"));
-                inline_html(out, slice(s, next, end), resolve, context, depth + 1);
-                append(out, strong ? S("</strong>") : S("</em>"));
-                next = end + 1 + strong;
-                dst = room(out, (s.n - next) * 6 + 16);
-                break;
-            }
-            case '[': {
-                if (!labels) goto literal;
-                size label_end = closer(s, next, ']', 0, 0);
-                if (label_end == NPOS) {
-                    labels = 0;
-                    goto literal;
-                }
-                if (at(s, label_end + 1) != '(') goto literal;
-                size end = link_end(s, label_end + 2);
-                if (end == NPOS || end == label_end + 2) goto literal;
-                Str target = slice(s, label_end + 2, end);
-                Value href = resolve(context, target);
-                out->n = dst - out->p;
-                ADD(out, "<a href=\\\"");
-                if (href.kind == LITERAL_STRING) append(out, value_text(&href));
-                else json(out, value_text(&href), 1, 0);
-                ADD(out, "\\\">");
-                inline_html(out, slice(s, next, label_end), resolve, context, depth + 1);
-                ADD(out, "</a>");
-                next = end + 1;
-                dst = room(out, (s.n - next) * 6 + 16);
-                break;
-            }
-            case 0xed: {
-                next = i;
-                uint cp = decode(s, &next);
-                if (cp < 0xd800 || cp > 0xdfff) goto literal;
-                out->n = dst - out->p;
-                json_code_unit(out, cp);
-                dst = out->p + out->n;
-                break;
-            }
-            default:
-literal:
-                *dst++ = s.p[i];
-                next = i + 1;
-                break;
-        }
-        i = next;
-    }
-    out->n = dst - out->p;
+#define INLINE_HTML inline_avx2
+#define INLINE_TARGET __attribute__((target("avx2")))
+#define INLINE_SHUFFLE 1
+#include "inline.inc"
+#undef INLINE_HTML
+#undef INLINE_TARGET
+#undef INLINE_SHUFFLE
+
+static inline void inline_html(Buf *out, Str s, LinkContext *context, uint depth) {
+    if (has_avx2) inline_avx2(out, s, context, depth);
+    else inline_sse2(out, s, context, depth);
 }
 
 enum Block { PARAGRAPH, FENCE = 7, BREAK, BLANK };
@@ -408,7 +271,13 @@ static __attribute__((target("avx2,popcnt"), noinline)) void scan_wide(Lines *li
             // Keep the preceding gap and any carried lanes together.
             gaps = mask >> 31;
         }
-        count = queue_lines(lines->ends, count, i, breaks);
+        // A sentinel lets empty vectors and the first newline share one store.
+        uint first = __builtin_ctzl((size)breaks | (1UL << 32));
+        lines->ends[count] = i + first;
+        count += breaks != 0;
+        // The first break covers the common one-break vector. Dense lines
+        // reuse the ordinary bit iteration for any remaining breaks.
+        count = queue_lines(lines->ends, count, i, breaks & (breaks - 1));
     }
     lines->end_lines = count;
     lines->words += words;
@@ -491,7 +360,7 @@ static void code_block(Buf *html, Lines *lines) {
     if (lines->at <= body.n) advance(lines);
 }
 
-static void quote_block(Buf *html, Lines *lines, ResolveLink resolve, void *context) {
+static void quote_block(Buf *html, Lines *lines, LinkContext *context) {
     Buf *content = start_markdown_text();
     do {
         Str trimmed = trim_line(tail(lines->line, 1));
@@ -504,13 +373,13 @@ static void quote_block(Buf *html, Lines *lines, ResolveLink resolve, void *cont
     ADD(html, "<blockquote>\\n");
     if (content->n) {
         ADD(html, "<p>");
-        inline_html(html, take(content), resolve, context, 0);
+        inline_html(html, take(content), context, 0);
         ADD(html, "</p>\\n");
     }
     ADD(html, "</blockquote>\\n");
 }
 
-static void list_block(Buf *html, Lines *lines, size marker, ResolveLink resolve, void *context) {
+static void list_block(Buf *html, Lines *lines, size marker, LinkContext *context) {
     int ordered = marker != 2;
     size start = ordered ? decimal(slice(lines->line, 0, marker - 2)) : 1;
     if (start != 1) {
@@ -534,7 +403,7 @@ static void list_block(Buf *html, Lines *lines, size marker, ResolveLink resolve
             item = take(merged);
         }
         ADD(html, "<li>");
-        inline_html(html, item, resolve, context, 0);
+        inline_html(html, item, context, 0);
         ADD(html, "</li>\\n");
         marker = list_marker(lines->line);
         if (!marker || (marker != 2) != ordered) break;
@@ -569,7 +438,7 @@ struct Heading {
     Value item, fields[3];
 };
 
-Markdown markdown(Str body, ResolveLink resolve, void *context) {
+Markdown markdown(Str body, LinkContext *context) {
     Lines lines = {.body = body, .end = NPOS, .preceding_gap = 1};
     Markdown result = {.excerpt = {.kind = RENDERED}};
     Buf html = start_html();
@@ -600,7 +469,7 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
             append(&html, id);
             ADD(&html, "\\\">");
             size from = html.n;
-            inline_html(&html, text, resolve, context, 0);
+            inline_html(&html, text, context, 0);
             if (kind == 2 || kind == 3) {
                 Heading *heading = NEW(Heading, 1);
                 heading->next = 0;
@@ -617,16 +486,16 @@ Markdown markdown(Str body, ResolveLink resolve, void *context) {
             ADD(&html, ">\\n");
             advance(&lines);
         } else if (at(lines.line, 0) == '>') {
-            quote_block(&html, &lines, resolve, context);
+            quote_block(&html, &lines, context);
         } else {
             size marker = list_marker(lines.line);
             if (marker) {
-                list_block(&html, &lines, marker, resolve, context);
+                list_block(&html, &lines, marker, context);
             } else {
                 Str text = paragraph(&lines, &kind);
                 ADD(&html, "<p>");
                 size from = html.n;
-                inline_html(&html, text, resolve, context, 0);
+                inline_html(&html, text, context, 0);
                 if (!excerpt) {
                     result.excerpt = rendered(tail(take(&html), from));
                     excerpt = 1;

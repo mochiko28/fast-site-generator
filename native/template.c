@@ -538,6 +538,11 @@ static void render_loop(Buf *out, const Op *node, const Scope *scope, uint depth
     }
 }
 
+// These buffers do not overlap. REP MOVSB avoids several size classes.
+static inline void copy_rendered(char *out, Str text) {
+    __asm__ volatile ("rep movsb" : "+D"(out), "+S"(text.p), "+c"(text.n) : : "memory");
+}
+
 static void render_ops(Buf *out, const Op *ops, const Scope *scope, uint include_depth, uint stack_depth) {
     if (!ops) return;
     if (stack_depth > 512) fail();
@@ -547,14 +552,49 @@ static void render_ops(Buf *out, const Op *ops, const Scope *scope, uint include
             node = node->run->last;
             continue;
         }
+        if (node->kind == RAW || node->kind == ESCAPED) {
+            const Value *v = lookup(scope, &node->path);
+            if (v) {
+                Str text;
+                switch (v->kind) {
+                    case LITERAL_STRING:
+                        text = value_text(v);
+                        break;
+                    case RENDERED:
+                        if (node->kind != RAW) goto generic_value;
+                        text = value_text(v);
+                        break;
+                    case PREPARED_STRING:
+                        if (node->kind != ESCAPED) goto generic_value;
+                        text = (Str){v->prepared->escaped, v->prepared->length};
+                        break;
+                    default:
+                        goto generic_value;
+                }
+                Str prefix = node->prefix;
+                size n = prefix.n + text.n;
+                if (n <= out->cap - out->n) {
+                    char *dst = out->p + out->n;
+                    if (prefix.n) copy_rendered(dst, prefix);
+                    if (text.n) copy_rendered(dst + prefix.n, text);
+                    out->n += n;
+                } else {
+                    append(out, prefix);
+                    append(out, text);
+                }
+                continue;
+            }
+        generic_value:
+            append(out, node->prefix);
+            write_value(out, v, node->kind == RAW);
+            continue;
+        }
         append(out, node->prefix);
         switch (node->kind) {
             case GLOBAL_RUN:
                 write_value(out, lookup(scope, &node->path), node->original_kind == RAW);
                 break;
-            case RAW: case ESCAPED:
-                write_value(out, lookup(scope, &node->path), node->kind == RAW);
-                break;
+            case RAW: case ESCAPED: fail();
             case FOR:
                 render_loop(out, node, scope, include_depth, stack_depth + 1);
                 break;

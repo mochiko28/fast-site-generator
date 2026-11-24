@@ -1,6 +1,14 @@
 #include "core.h"
 
-enum JsonKind { JSTRING, JNUMBER, JARRAY, JOBJECT, JNULL, JBOOLEAN };
+enum JsonKind { JSTRING, JNUMBER, JARRAY, JOBJECT, JNULL, JBOOLEAN, JFILES };
+enum JsonContext { GENERIC_JSON, CASE_JSON, SITE_JSON, FILES_JSON };
+
+typedef struct File File;
+struct File {
+    Str path, text;
+    union { File *next; const Value *url; };  // Parsed list, then cached static URL.
+    int has_cr, written;
+};
 
 typedef struct Json Json;
 // The input window bounds every JSON slice and stays at one address during parsing.
@@ -10,10 +18,11 @@ struct Json {
     union {
         InputSlice text;
         Json *child;
+        File *files;
     };
     InputSlice key;
     uint count;
-    byte kind, has_cr;
+    byte kind;
 };
 
 static const char *input_base;
@@ -296,6 +305,13 @@ static Str read_string(Parser *p, int *has_cr) {
     char *text = (char *)input.p + from;
     char *write = (char *)input.p + end;
     uint carriage_return = 0;
+    // Let the vector decoder handle the first escape too when it has room.
+    if (has_avx2 && input.n - end >= 16) {
+        int special;
+        from = copy_json_wide(input, end, &write, &carriage_return, &special);
+        if (special) end = from;
+        else goto copy_tail;
+    }
     for (;;) {
 decode_escape:
         if (at(input, end) == '"') break;
@@ -359,6 +375,7 @@ decode_escape:
                 from = end + 2;
             }
         }
+copy_tail:
         for (;;) {
             if (from >= input.n) {
                 if (!refill(p, from)) fail();
@@ -415,16 +432,92 @@ static Str read_number(Parser *p) {
     return result;
 }
 
-static Json *read_value(Parser *p, uint depth) {
+static Json *read_value(Parser *p, uint depth, enum JsonContext context);
+
+static inline int same_word(const char *a, const char *b) {
+    size left, right;
+    __builtin_memcpy(&left, a, sizeof(left));
+    __builtin_memcpy(&right, b, sizeof(right));
+    return left == right;
+}
+
+// The two unaligned words cover a prefix of 8 to 16 bytes.
+static inline int member_prefix(Str raw, Str prefix) {
+    if (raw.n < prefix.n || !same_word(raw.p, prefix.p)) return 0;
+    size tail = prefix.n - sizeof(size);
+    return !tail || same_word(raw.p + tail, prefix.p + tail);
+}
+
+// Only path and content are needed from a file record. Preserve last-wins
+// fields and validate extra values with the ordinary parser.
+static File *read_file(Parser *p, uint depth) {
+    if (depth > 128) fail();
+    Str path = {0}, text = {0};
+    int has_cr = 0;
+    if (peek(p) != '{') {
+        read_value(p, depth, GENERIC_JSON);
+    } else {
+        p->pos++;
+        if (peek(p) != '}') {
+            for (;;) {
+                Str raw = tail(p->source, p->pos);
+                if (member_prefix(raw, S("\"path\":\""))) {
+                    p->pos += 7;
+                    path = read_string(p, 0);
+                } else if (member_prefix(raw, S("\"content\":\""))) {
+                    p->pos += 10;
+                    has_cr = 0;
+                    text = read_string(p, &has_cr);
+                } else {
+                    if (peek(p) != '"') fail();
+                    Str key = read_string(p, 0);
+                    expect(p, ':');
+                    int is_content = equal(key, S("content"));
+                    Str *field = is_content ? &text : equal(key, S("path")) ? &path : 0;
+                    if (field && peek(p) == '"' && depth < 128) {
+                        if (is_content) has_cr = 0;
+                        *field = read_string(p, is_content ? &has_cr : 0);
+                    } else {
+                        read_value(p, depth + 1, GENERIC_JSON);
+                        if (field) *field = (Str){0};
+                    }
+                }
+                if (peek(p) != ',') break;
+                p->pos++;
+            }
+        }
+        expect(p, '}');
+    }
+    File *file = NEW(File, 1);
+    *file = (File){.path = path, .text = text, .has_cr = has_cr};
+    return file;
+}
+
+static Json *read_value(Parser *p, uint depth, enum JsonContext context) {
     if (depth > 128) fail();
     int first = peek(p);
     Json *value = NEW(Json, 1);
     value->next = 0;
     if (first == '"') {
         value->kind = JSTRING;
-        int has_cr = 0;
-        value->text = input_slice(read_string(p, &has_cr));
-        value->has_cr = has_cr;
+        value->text = input_slice(read_string(p, 0));
+    } else if (first == '[' && context == FILES_JSON) {
+        value->kind = JFILES;
+        p->pos++;
+        File **next = &value->files;
+        value->count = 0;
+        if (peek(p) != ']') {
+            for (;;) {
+                File *file = read_file(p, depth + 1);
+                *next = file;
+                next = &file->next;
+                value->count++;
+                if (peek(p) != ',') break;
+                p->pos++;
+            }
+        }
+        *next = 0;
+        expect(p, ']');
     } else if (first == '[' || first == '{') {
         value->kind = first == '[' ? JARRAY : JOBJECT;
         int close = first == '[' ? ']' : '}';
@@ -439,7 +532,10 @@ static Json *read_value(Parser *p, uint depth) {
                     name = read_string(p, 0);
                     expect(p, ':');
                 }
-                Json *item = read_value(p, depth + 1);
+                enum JsonContext child = GENERIC_JSON;
+                if (context == CASE_JSON && equal(name, S("input"))) child = SITE_JSON;
+                else if (context == SITE_JSON && equal(name, S("files"))) child = FILES_JSON;
+                Json *item = read_value(p, depth + 1, child);
                 item->key = input_slice(name);
                 *next = item;
                 next = &item->next;
@@ -488,7 +584,6 @@ static long as_integer(const Json *value) {
     return negative ? -n : n;
 }
 
-typedef struct { Str path, text; int has_cr, written; } File;
 typedef struct Warning Warning;
 struct Warning { Str text; Warning *next; };
 
@@ -527,7 +622,7 @@ struct TagEntry {
 
 typedef struct {
     Str base;
-    Map templates, sources, statics, directories, links, broken, tags, tag_slugs;
+    Map templates, paths, directories, broken, tags, tag_slugs;
     Warning *warnings;
     size warning_count;
     TagEntry **tag_order;
@@ -627,8 +722,19 @@ static Str read_tags(Str raw, Front *front) {
     if (at(raw, 0) != '[' || at(raw, raw.n - 1) != ']') return S("not a list [a, b]");
     raw = slice(raw, 1, raw.n - 1);
     if (!trim(raw).n) return (Str){0};
-    size count = 1;
-    for (size i = 0; i < raw.n; i++) count += raw.p[i] == ',';
+    size count = 1, i = 0;
+    for (; raw.n - i >= 16; i += 16) {
+        Vec bytes = *(const Vec *)(raw.p + i);
+        Vec invalid = (bytes == SPLAT('"')) | (bytes == SPLAT('[')) | (bytes == SPLAT(']'));
+        if (__builtin_ia32_pmovmskb128(invalid)) return S("an empty tag, or one holding \" [ or ]");
+        unsigned commas = __builtin_ia32_pmovmskb128(bytes == SPLAT(','));
+        for (; commas; commas &= commas - 1) count++;
+    }
+    for (; i < raw.n; i++) {
+        int c = raw.p[i];
+        if (c == '"' || c == '[' || c == ']') return S("an empty tag, or one holding \" [ or ]");
+        count += c == ',';
+    }
     front->tag_names = NEW(Str, count);
     front->tag_count = count;
     size from = 0;
@@ -636,8 +742,7 @@ static Str read_tags(Str raw, Front *front) {
         size end = find_char(raw, from, ',');
         if (end == NPOS) end = raw.n;
         Str name = trim(slice(raw, from, end));
-        if (!name.n || find_char(name, 0, '"') != NPOS ||
-            find_char(name, 0, '[') != NPOS || find_char(name, 0, ']') != NPOS)
+        if (!name.n)
             return S("an empty tag, or one holding \" [ or ]");
         front->tag_names[i] = name;
         from = end + 1;
@@ -645,14 +750,12 @@ static Str read_tags(Str raw, Front *front) {
     return (Str){0};
 }
 
-enum FrontKey { TITLE, DATE, TAGS, DRAFT, LAYOUT, SLUG, SUMMARY };
-static const ShortLiteral keys[] = {
-    SHORT("title"), SHORT("date"), SHORT("tags"), SHORT("draft"), SHORT("layout"), SHORT("slug"), SHORT("summary")
-};
+enum FrontKey { TITLE, DATE, TAGS, DRAFT, LAYOUT, SLUG, SUMMARY, UNKNOWN_FRONT_KEY };
 #undef SHORT
 
 static Str key_value(Front *front, enum FrontKey key, Str raw) {
     switch (key) {
+        case UNKNOWN_FRONT_KEY: fail();
         case TITLE: return read_title(raw, &front->title);
         case SUMMARY: return read_title(raw, &front->summary);
         case TAGS: return read_tags(raw, front);
@@ -680,6 +783,27 @@ static Str key_value(Front *front, enum FrontKey key, Str raw) {
     return (Str){0};
 }
 
+static enum FrontKey front_key(Str key) {
+    switch (key.n) {
+        case 4:
+            if (equal(key, S("date"))) return DATE;
+            if (equal(key, S("tags"))) return TAGS;
+            if (equal(key, S("slug"))) return SLUG;
+            break;
+        case 5:
+            if (equal(key, S("title"))) return TITLE;
+            if (equal(key, S("draft"))) return DRAFT;
+            break;
+        case 6:
+            if (equal(key, S("layout"))) return LAYOUT;
+            break;
+        case 7:
+            if (equal(key, S("summary"))) return SUMMARY;
+            break;
+    }
+    return UNKNOWN_FRONT_KEY;
+}
+
 static Str parse_front_line(Front *front, Str line, size number_line, uint *seen) {
     if (at(line, 0) == '#' || only_indent(line)) return (Str){0};
     size colon = 0;
@@ -688,9 +812,8 @@ static Str parse_front_line(Front *front, Str line, size number_line, uint *seen
         || has_line_separator(line))
         return JOIN(S("line "), number(number_line), S(" is not \"key: value\""));
     Str key = slice(line, 0, colon);
-    size k = 0;
-    while (k < COUNT(keys) && !equal(key, (Str){keys[k].text, keys[k].length})) k++;
-    if (k == COUNT(keys)) return JOIN(S("unknown key \""), key, S("\""));
+    enum FrontKey k = front_key(key);
+    if (k == UNKNOWN_FRONT_KEY) return JOIN(S("unknown key \""), key, S("\""));
     if (*seen & (1u << k)) return JOIN(S("key \""), key, S("\" is given twice"));
     *seen |= 1u << k;
     size from = colon + 2, end = line.n;
@@ -704,24 +827,24 @@ static Str parse_front_line(Front *front, Str line, size number_line, uint *seen
 static Front front_matter(Str text) {
     if (!starts(text, S("---\n"))) return (Front){.error = equal(text, S("---"))
         ? S("the front matter is not closed") : S("no front matter")};
-    size close = 3;
-    for (;;) {
-        close = find_str(text, close, S("\n---"));
-        if (close == NPOS) return (Front){.error = S("the front matter is not closed")};
-        close += 4;
-        if (close == text.n || at(text, close) == '\n') break;
-    }
     Front front = {0};
     uint seen = 0;
-    for (size from = 4, n = 2; from <= close - 4; n++) {
+    // An unterminated header takes precedence over an invalid field.
+    for (size from = 4, line = 2;; line++) {
         size end = find_char(text, from, '\n');
-        front.error = parse_front_line(&front, slice(text, from, end), n, &seen);
-        if (front.error.n) return front;
+        if (end == NPOS) end = text.n;
+        Str current = slice(text, from, end);
+        if (equal(current, S("---"))) {
+            if (!front.error.n) {
+                if (!(seen & (1u << TITLE))) front.error = S("no title");
+                else if (end < text.n) front.body = tail(text, end + 1);
+            }
+            return front;
+        }
+        if (end == text.n) return (Front){.error = S("the front matter is not closed")};
+        if (!front.error.n) front.error = parse_front_line(&front, current, line, &seen);
         from = end + 1;
     }
-    if (!(seen & (1u << TITLE))) front.error = S("no title");
-    else if (close < text.n) front.body = tail(text, close + 1);
-    return front;
 }
 
 static void load_templates(Site *site, const Json *templates, const Value *settings) {
@@ -791,11 +914,11 @@ static void add_page(Site *site, Page *page, const File *file) {
     v[P_DATE] = literal_string(front.date);
     v[P_SUMMARY] = prepare_text(front.summary);
     v[P_SLUG] = literal_string(slug);
-    set(&site->sources, file->path, page);
+    set(&site->paths, file->path, page);
     PHASE_END(front_phase);
 }
 
-typedef struct { Site *site; Page *page; Map *resolved; } LinkContext;
+struct LinkContext { Site *site; Page *page; };
 
 static int scheme(Str target) {
     if (!letter(at(target, 0))) return 0;
@@ -880,24 +1003,11 @@ static Str relative_path(Str dir, Str rel, char *storage, size capacity) {
     return (Str){out, bytes};
 }
 
-static Value link_target(void *context, Str target) {
+Value resolve_link(LinkContext *link, Str target) {
     int first = at(target, 0);
     if (first == '/' || first == '#' || scheme(target)) return string(target);
-    LinkContext *link = context;
     Site *site = link->site;
     Str dir = {link->page->path.p, link->page->directory_length};
-    if (!link->resolved) {
-        void **slot = entry_value(&site->links, dir);
-        if (!*slot) {
-            Map *links = NEW(Map, 1);
-            *links = (Map){0};
-            *slot = links;
-        }
-        link->resolved = *slot;
-    }
-    // Successful links depend only on the directory and the target within a case.
-    Value *saved = get(link->resolved, target);
-    if (saved) return *saved;
     size hash = find_char(target, 0, '#');
     if (hash == NPOS) hash = target.n;
     Str frag = tail(target, hash);
@@ -905,9 +1015,24 @@ static Value link_target(void *context, Str target) {
     Str path = relative_path(dir, slice(target, 0, hash), path_bytes, sizeof(path_bytes));
     Value resolved = string(target);
     if (path.p) {
-        const Page *page = get(&site->sources, path);
-        if (page) resolved = frag.n ? template_text(JOIN(value_text(&page->values[P_URL]), frag)) : page->values[P_URL];
-        else if (get(&site->statics, path)) resolved = template_text(JOIN(site->base, S("/"), path, frag));
+        // A path belongs to exactly one record kind, based on its extension.
+        void *record = get(&site->paths, path);
+        if (record) {
+            if (ends(path, S(".md"))) {
+                const Page *page = record;
+                resolved = frag.n ? template_text(JOIN(value_text(&page->values[P_URL]), frag)) : page->values[P_URL];
+            } else if (frag.n) {
+                resolved = template_text(JOIN(site->base, S("/"), path, frag));
+            } else {
+                File *file = record;
+                if (!file->url) {
+                    Value *url = NEW(Value, 1);
+                    *url = template_text(JOIN(site->base, S("/"), path));
+                    file->url = url;
+                }
+                return *file->url;
+            }
+        }
     }
     if (resolved.bytes == target.p) {
         Str warning = JOIN(S("broken-link "), link->page->path, S(" -> "), target);
@@ -915,10 +1040,6 @@ static Value link_target(void *context, Str target) {
             set(&site->broken, warning, (void *)1);
             warn(site, warning);
         }
-    } else {
-        saved = NEW(Value, 1);
-        *saved = resolved;
-        set(link->resolved, retain_link_key(target), saved);
     }
     return resolved;
 }
@@ -1008,7 +1129,7 @@ static void card(Site *site, Page *page) {
 static void render_markdown(Site *site, Page *page) {
     PHASE_BEGIN(previous, MARKDOWN);
     LinkContext context = {.site = site, .page = page};
-    Markdown md = markdown(page->body, link_target, &context);
+    Markdown md = markdown(page->body, &context);
     Value *v = page->values;
     v[P_EXCERPT] = md.excerpt;
     v[P_MINUTES] = numeric(md.minutes);
@@ -1047,7 +1168,7 @@ static void write_key(Site *site, Buf *out, Str path) {
 static void write_template(Site *site, Buf *out, Str path, const Template *template,
                            const Value *locals, const Value *globals) {
     if (site->index_statics) {
-        File *file = get(&site->statics, path);
+        File *file = get(&site->paths, path);
         if (file) file->written = 1;
     }
     write_key(site, out, path);
@@ -1084,7 +1205,7 @@ static void write_statics(Site *site, Buf *out, File **files, size n) {
     for (size i = 0; i < n; i++) {
         const File *f = files[i];
         // The map entry is shared by inputs with the same path.
-        File *file = get(&site->statics, f->path);
+        File *file = get(&site->paths, f->path);
         if (file->written) {
             warn(site, JOIN(S("shadowed "), f->path, S(": a built page has its path")));
         } else if (!equal(f->path, S("__proto__"))) {
@@ -1130,17 +1251,17 @@ static void build_site(Buf *out, const Json *input) {
     load_templates(&site, field(input, S("templates")), &site_value);
     PHASE(FRONT);
     const Json *input_files = field(input, S("files"));
-    if (input_files->kind != JARRAY) fail();
+    if (!input_files || input_files->kind != JFILES) fail();
     size n = input_files->count;
-    reserve_map(&site.sources, n);
-    File *data = NEW(File, n);
+    reserve_map(&site.paths, n);
     File **files = NEW(File *, n);
     size i = 0;
-    for (const Json *entry = input_files->child; entry; entry = entry->next, i++) {
-        const Json *content = field(entry, S("content"));
-        Str text = as_string(content);
-        data[i] = (File){.path = as_string(field(entry, S("path"))), .text = text, .has_cr = content->has_cr};
-        files[i] = &data[i];
+    for (File *f = input_files->files; f;) {
+        if (!f->path.p || !f->text.p) fail();
+        File *next = f->next;
+        f->url = 0;
+        files[i++] = f;
+        f = next;
     }
     sort((void **)files, n, file_order);
 
@@ -1163,7 +1284,7 @@ static void build_site(Buf *out, const Json *input) {
             page_count++;
             if (p->post) posts[post_count++] = p;
         } else {
-            set(&site.statics, f->path, f);
+            set(&site.paths, f->path, f);
             site.index_statics |= ends(f->path, S("index.html"));
             files[static_count++] = f;
         }
@@ -1240,7 +1361,7 @@ static void parse_batch(Buf *out, char *source, size length) {
         for (;;) {
             size mark = checkpoint();
             PHASE(PARSE);
-            const Json *item = read_value(&parser, 0);
+            const Json *item = read_value(&parser, 0, CASE_JSON);
             PHASE(FRONT);
             build_site(out, field(item, S("input")));
             PHASE(PARSE);

@@ -401,12 +401,6 @@ Buf *start_markdown_text(void) {
     return &markdown_text;
 }
 
-Str retain_link_key(Str text) {
-    // Cached links outlive the temporary text assembled for one block.
-    if ((size)text.p - (size)markdown_text.p < MARKDOWN_TEXT_LIMIT) return JOIN(text);
-    return text;
-}
-
 Str retain_html(size mark, Str text) {
     char *dst = html + mark;
     if (text.n && dst != text.p) copy(dst, text.p, text.n);

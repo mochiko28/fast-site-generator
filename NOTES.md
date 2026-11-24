@@ -444,3 +444,67 @@ The `nothp` native CPU median fell 7.5% and weighted cost fell 6.8%. The median 
 The logs and individual measurements are in `/work/.tmp/t20/logs`. `final-41.json` contains the benchmark rounds and `fine-21.json` contains the detailed timers. The worktree addon rebuilt byte for byte to the tested staging binary.
 
 Changed files are `native/core.c`, `native/core.h`, `native/markdown.c`, `native/site.c`, `native/template.c`, `native/text.c`, `site.node`, and `NOTES.md`.
+
+### Native CPU and launch pass (t21)
+
+- Markdown's AVX2 path classifies 16 bytes at a time with a nibble-indexed shuffle. It uses the same renderer as the SSE2 path. The 32-byte line scan queues the first newline without a branch on empty masks. Front matter is scanned one line at a time, with the missing closing delimiter still taking precedence over field errors.
+- The JSON vector decoder can handle the first simple escape in a string. Files are parsed directly into the records used by site preparation, with a direct match for compact `path` and `content` members. The general parser handles extra members, escaped keys, whitespace, and last-wins duplicates.
+- Markdown links and static publication share one map of source paths. Static URLs without fragments are prepared once per file. This replaces the directory-and-target cache and leaves broken-link warnings keyed by the referring page and target. The scratch arena used 164 4 KiB pages under `nothp`, down from 195.
+- Template substitutions copy a literal prefix and an already escaped value after one space check. Repeated partials use the existing per-case include cache. Trials that grouped more root literals or cached entire loop bodies took longer, and increasing the include cache traded additional pages for small CPU gains.
+
+#### Practice comparison
+
+The table uses 41 interleaved runs per entry, build, and mode on CPU 7 with a reused output path. Native CPU and faults use the `SITE_PROFILE` thread CPU clock and process fault delta. The process columns use `wait4` on production binaries. Weighted cost uses the CPU of the row's mode, 0.003 ms per `nothp` native minor fault, and 0.005 ms per native syscall. Both native builds made 66 calls, including 24 `pread64` and 29 `write` calls. The `nothp` launcher reported `THP_enabled: 0` and the normal launcher reported `THP_enabled: 1`.
+
+| Entry | Mode | Native minor faults | Native CPU ms | Native syscalls | Weighted ms | Process minor faults | Process CPU ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD `81781c7` | normal | 7 | 9.435 | 66 | 11.616 | 6,735 | 49.551 |
+| Final | normal | 7 | 8.796 | 66 | 10.884 | 6,735 | 49.636 |
+| Kit null | normal | 0 | 0.000 | 0 | 0.000 | 7,018 | 46.638 |
+| HEAD `81781c7` | nothp | 617 | 9.015 | 66 | 11.196 | 8,928 | 50.443 |
+| Final | nothp | 586 | 8.399 | 66 | 10.487 | 8,898 | 50.090 |
+| Kit null | nothp | 0 | 0.000 | 0 | 0.000 | 8,603 | 47.457 |
+
+Under `nothp`, weighted cost fell by 0.709 ms (6.3%) and native CPU fell by 0.616 ms (6.8%). The median paired weighted change was −0.698 ms. Whole-process CPU fell from 50.443 to 50.090 ms, 2.633 ms above the kit null. The normal process CPU median rose by 0.085 ms. Native faults fell by 31 under `nothp` and held at seven in normal mode.
+
+#### Fine profile
+
+The ten largest final sub-steps are from 21 interleaved `nothp` runs of the 31-bucket `lfence` and `rdtsc` builds. Timings exclude nested probes and subtract a measured per-interval overhead. TSC ticks measure elapsed time and the probes affect execution. The coarse profiles above use the native thread CPU clock.
+
+| Rank | Sub-step | HEAD ticks (M) | Final ticks (M) |
+| ---: | --- | ---: | ---: |
+| 1 | Markdown inline scanning, dispatch, and copies | 5.154 | 4.811 |
+| 2 | JSON string escape decoding | 2.893 | 2.882 |
+| 3 | Output writes | 2.608 | 2.577 |
+| 4 | Input reads | 2.361 | 2.317 |
+| 5 | Template dispatch and fused substitutions | 0.725 | 1.753 |
+| 6 | Markdown line scans and word counts | 1.558 | 1.227 |
+| 7 | Other site preparation and serialization | 1.201 | 1.124 |
+| 8 | Markdown link resolution | 1.550 | 1.077 |
+| 9 | Template includes | 0.906 | 0.859 |
+| 10 | File slugs and page records | 0.853 | 0.833 |
+
+In the coarse `nothp` profile, Markdown went from 3.697 to 3.310 ms, templates from 1.372 to 1.226 ms, and JSON parsing from 0.991 to 0.980 ms. The fused template fast path moves samples from value and literal probes to dispatch. The combined dispatch, value, and literal buckets measured 2.037 million ticks at HEAD and 2.003 million in the final fine profile.
+
+#### Launch trials
+
+The separate 41-run trials tested a direct `process.dlopen` call, an ELF `DT_INIT` constructor, a merged ELF load segment, and shorter regular launchers. The regular launch variants had mixed process CPU results across modes and repeat trials. At registration, HEAD and final both had seven present ELF pages in both modes. Merging the segments left 26 and 27 pages present in normal and `nothp` mode, respectively. A local symlink from `main.ts` to a CommonJS launcher removed roughly 25 ms of process CPU. The kit's runtime selector requires a regular `main.ts`, so the shipped launcher keeps its two `require` calls.
+
+#### Verification
+
+| Check | Output |
+| --- | --- |
+| SHA-256 seeds 0–104 | 315 byte-identical sites in each of automatic, forced SSE2, and forced AVX2 dispatch. Zero JS fallbacks. |
+| SHA-256 seeds 105–204 | 300 byte-identical sites in each dispatch mode. Zero JS fallbacks. |
+| SHA-256 seeds 0–34 through `nothp` | 105 byte-identical sites, zero JS fallbacks. |
+| `test.sh`, `test2.sh`, `test3.sh` | 9, 16, and 8 `OK` lines. |
+| `cases4` and `cases5` | 20 `OK` lines with `MAKEFUN_OUTPUT_DIR=/work/.tmp/t21/out`. |
+| Forced early fallback, normal and `nothp` | 0 native bytes written. JS rewrote 7,391,492 exact bytes. |
+| Forced late fallback, normal and `nothp` | 1,310,720 exact native prefix bytes. JS rewrote all 7,362,887 answer bytes. |
+| Publication | Exact 7,446,432-byte overwrite and truncate, staged symlink and hardlink replacements, staged failure cleanup, and retry behind a held writer lock. |
+| Targeted cases | 53 byte-identical fixtures, 120 streaming boundary cases, 1,056 escape-boundary sites, 352 Unicode whitespace files in each dispatch build, and 54 duplicate-key and front matter cases in each dispatch build. |
+| ELF | Only `napi_register_module_v1` exported. Zero undefined dynamic symbols, relocations, dependencies, and symbol versions. AVX2 is selected at runtime. |
+
+The raw runs, profiles, and verification logs are in `/work/.tmp/t21/logs`. The worktree addon rebuilt byte for byte to the tested staging binary.
+
+Changed files are `native/core.c`, `native/core.h`, `native/inline.inc`, `native/markdown.c`, `native/site.c`, `native/template.c`, `site.node`, and `NOTES.md`.

@@ -48,7 +48,6 @@ Buf start_html(void);
 void finish_html(const Buf *out);
 size html_checkpoint(void);
 Buf *start_markdown_text(void);
-Str retain_link_key(Str text);
 Str retain_html(size mark, Str text);
 size answer_position(const Buf *out);
 void restart_answer(void);
@@ -184,8 +183,9 @@ typedef struct {
     Value html, excerpt, toc;
     size minutes;
 } Markdown;
-typedef Value (*ResolveLink)(void *context, Str target);
-Markdown markdown(Str body, ResolveLink resolve, void *context);
+typedef struct LinkContext LinkContext;
+Value resolve_link(LinkContext *context, Str target);
+Markdown markdown(Str body, LinkContext *context);
 
 size checkpoint(void);
 void rewind_arena(size mark);
