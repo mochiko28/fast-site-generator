@@ -14,6 +14,6 @@ The latest pass matches common front-matter layouts in one native call and uses 
 
 The nine-run practice median was 269 ms, down from 279 ms for v3. All 43 sets passed and their answer files matched v3 byte for byte. That includes eight new seeded sets and targeted cases in both encoding modes. The paragraph scan, guarded inline replacements, and GC settings tested in this pass were dropped after timing them.
 
-The driver releases the input text after parsing and drops each case from the input array as its build starts. Output is flushed at file boundaries after accumulating 32 KiB, so written strings can be collected during the build. Reading time counts word-group matches without retaining the matched strings. V8 uses a semi-space growth factor of 1 and disables parallel scavenging and background minor GC tasks.
+The heap pass escapes HTML in one pass and serializes Markdown bodies together within each site. Relative links reuse resolutions by source directory, and Markdown line handling and reading-time counts avoid temporary substrings and match arrays.
 
-Against v5base, nine-run practice medians went from 20,337 to 11,907 minor faults and from 169 to 167 ms total CPU. Median peak RSS fell from 114,212 to 80,352 KiB. All 53 sets passed and matched v5base byte for byte.
+On practice, estimated heap allocation fell from 61.38 MB to 47.76 MB. Each traced run had five scavenges before and four after, a 20% reduction. The median summed GC time over nine runs fell from 23.19 ms to 18.61 ms, and median CPU fell from 296 ms to 292 ms. All 53 supplied checks passed, and their JSON output matched v5base byte for byte.
